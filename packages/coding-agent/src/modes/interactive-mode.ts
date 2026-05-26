@@ -2581,6 +2581,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showModelSelector(options);
 	}
 
+	showFilePicker(): void {
+		this.#selectorController.showFilePicker();
+	}
 	showPluginSelector(mode?: "install" | "uninstall"): void {
 		void this.#selectorController.showPluginSelector(mode);
 	}

@@ -27,6 +27,7 @@ interface AppKeybindings {
 	"app.model.select": true;
 	"app.model.selectTemporary": true;
 	"app.tools.expand": true;
+	"app.file.picker": true;
 	"app.editor.external": true;
 	"app.message.followUp": true;
 	"app.message.dequeue": true;
@@ -129,6 +130,10 @@ export const KEYBINDINGS = {
 		defaultKeys: "alt+shift+c",
 		description: "Copy prompt",
 	},
+	"app.file.picker": {
+		defaultKeys: "alt+shift+f",
+		description: "Open file picker",
+	},
 	"app.session.new": {
 		defaultKeys: [],
 		description: "Create new session",
@@ -215,6 +220,8 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	pasteImage: "app.clipboard.pasteImage",
 	copyLine: "app.clipboard.copyLine",
 	copyPrompt: "app.clipboard.copyPrompt",
+	filePicker: "app.file.picker",
+	openFilePicker: "app.file.picker",
 	newSession: "app.session.new",
 	tree: "app.session.tree",
 	fork: "app.session.fork",

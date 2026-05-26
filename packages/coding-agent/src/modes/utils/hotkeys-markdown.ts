@@ -28,6 +28,7 @@ export function buildHotkeysMarkdown(bindings: HotkeysMarkdownBindings): string 
 		"| `Ctrl+K` | Delete to end of line |",
 		`| \`${appKey(bindings, "app.clipboard.copyLine")}\` | Copy current line |`,
 		`| \`${appKey(bindings, "app.clipboard.copyPrompt")}\` | Copy whole prompt |`,
+		`| \`${appKey(bindings, "app.file.picker")}\` | Open file picker |`,
 		"",
 		"**Other**",
 		"| Key | Action |",

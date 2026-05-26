@@ -14,6 +14,7 @@ type FakeEditor = {
 	onSelectModelTemporary?: () => void;
 	onSelectModel?: () => void;
 	onHistorySearch?: () => void;
+	onShowFilePicker?: () => void;
 	onShowHotkeys?: () => void;
 	onPasteImage?: () => Promise<boolean>;
 	onCopyPrompt?: () => void;
@@ -35,9 +36,11 @@ async function createContext() {
 	const keyMap: Record<string, string[]> = {
 		"app.model.selectTemporary": ["ctrl+y"],
 		"app.model.select": ["ctrl+l"],
+		"app.file.picker": ["alt+shift+f"],
 	};
 	const setActionKeys = vi.fn();
 	const showModelSelector = vi.fn();
+	const showFilePicker = vi.fn();
 	const prompt = vi.fn(async () => {});
 	const updatePendingMessagesDisplay = vi.fn();
 	const editor: FakeEditor = {
@@ -116,6 +119,7 @@ async function createContext() {
 		showHistorySearch: vi.fn(),
 		toggleThinkingBlockVisibility: vi.fn(),
 		showModelSelector,
+		showFilePicker,
 		updateEditorBorderColor: vi.fn(),
 		hasActiveBtw: vi.fn(() => false),
 	} as unknown as InteractiveModeContext;
@@ -128,6 +132,7 @@ async function createContext() {
 			setActionKeys,
 			showModelSelector,
 			prompt,
+			showFilePicker,
 			updatePendingMessagesDisplay,
 		},
 	};
@@ -153,6 +158,18 @@ describe("InputController keybinding setup", () => {
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(2);
 	});
 
+	it("wires the file picker action to the configured shortcut", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		expect(spies.setActionKeys).toHaveBeenCalledWith("app.file.picker", ["alt+shift+f"]);
+		expect(editor.onShowFilePicker).toBeDefined();
+
+		editor.onShowFilePicker?.();
+		expect(spies.showFilePicker).toHaveBeenCalledTimes(1);
+	});
 	it("marks streaming follow-up submissions as local", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
 		const session = ctx.session as unknown as { isStreaming: boolean };

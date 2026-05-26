@@ -1,13 +1,12 @@
 # Changelog
 
 ## [Unreleased]
-### Breaking Changes
 
+### Breaking Changes
 - The `vim` edit mode option is no longer available; configurations using `edit.mode: vim` will be automatically mapped to `hashline` mode
 - Hashline payload semantics are now strictly inline-first: the first payload line is whatever follows the sigil on the op line itself, and subsequent lines append after it. A newline immediately after `↑`/`↓`/`:` is no longer a free separator — it produces a blank first payload line. Use `LINE↓content` for a one-line insert, `LINE↓firstline\nsecondline` for two lines; bare `LINE↓` / `LINE↑` / `LINE:` (no inline payload) still insert/replace with one blank line as before.
 
 ### Added
-
 - Added `irc.timeoutMs` setting to configure IRC message timeout duration with a default of 120 seconds
 - Added timeout enforcement for IRC send operations to prevent indefinite hangs when recipients are unresponsive
 - Added evaluator state inheritance for `task`-spawned subagents so JavaScript and Python variables are visible between a parent agent and its child sessions
@@ -20,9 +19,10 @@
 - Added file-read snapshot caching with multi-snapshot ring per path for recovery from agent's own writes
 - Added delete operation (`!`) support to hashline grammar for explicit line deletion
 - Added structural bracket/brace balance warnings when deleting lines with unclosed constructs
+- Added a file picker overlay for browsing project paths and inserting the selected path into the editor
+- Selector mode can now open the file picker and insert backticked relative paths
 
 ### Changed
-
 - Changed Python tool bridge to use per-run identifiers alongside session IDs for correct routing of tool responses and output in concurrent evaluations
 - Changed JavaScript and Python `eval` execution to allow overlapping asynchronous cells on the same session ID to run concurrently instead of being strictly queued
 - Updated the edit mode option set to support `replace`, `patch`, `hashline`, and `apply_patch` variants
@@ -46,7 +46,6 @@
 - Updated prompt documentation to reflect new `¶PATH#HASH` header and bare line-number syntax
 
 ### Removed
-
 - Removed the `installH2Fetch()` activation from CLI startup; HTTPS fetches now use Bun's default transport
 - Removed the `vim` edit mode along with the `VimTool` module, prompt, and supporting buffer/engine/renderer stack
 - Removed per-line hash anchors (2-letter bigram hashes) from hashline format
@@ -57,14 +56,11 @@
 - Removed `HashMismatch` type and hash mismatch error reporting; replaced with file-level validation
 
 ### Fixed
-
 - Fixed JavaScript `eval` imports to preserve module-level singletons across re-imports of unchanged local files and reload them only after edits
 - Fixed concurrent Python evaluator tool calls to use per-run identifiers so tool responses and output are routed to the correct execution
 - Fixed the `search` tool argument validation to accept a single string `paths` value as a one-path search.
-
-### Added
-- Added a file picker overlay for browsing project paths and inserting the selected path into the editor
-- Selector mode can now open the file picker and insert backticked relative paths
+- Fixed the interactive file picker shortcut so the default `Alt+Shift+F` binding is registered again and opens the picker from the editor as documented
+- Restored the interactive file picker shortcut so the default `Alt+Shift+F` binding opens the picker from the editor
 ## [15.4.0] - 2026-05-26
 
 ### Breaking Changes

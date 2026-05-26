@@ -120,6 +120,8 @@ export class InputController {
 		this.ctx.editor.onHistorySearch = () => this.ctx.showHistorySearch();
 		this.ctx.editor.setActionKeys("app.thinking.toggle", this.ctx.keybindings.getKeys("app.thinking.toggle"));
 		this.ctx.editor.onToggleThinking = () => this.ctx.toggleThinkingBlockVisibility();
+		this.ctx.editor.setActionKeys("app.file.picker", this.ctx.keybindings.getKeys("app.file.picker"));
+		this.ctx.editor.onShowFilePicker = () => this.ctx.showFilePicker();
 		this.ctx.editor.setActionKeys("app.editor.external", this.ctx.keybindings.getKeys("app.editor.external"));
 		this.ctx.editor.onExternalEditor = () => void this.openExternalEditor();
 		this.ctx.editor.onShowHotkeys = () => this.ctx.handleHotkeysCommand();

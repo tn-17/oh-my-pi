@@ -37,3 +37,27 @@ describe("CustomEditor temporary model selector keybinding", () => {
 		expect(onSelectModelTemporary).toHaveBeenCalledTimes(1);
 	});
 });
+
+describe("CustomEditor file picker keybinding", () => {
+	it("opens the file picker on the default Alt+Shift+F shortcut", () => {
+		const editor = createEditor();
+		const onShowFilePicker = vi.fn();
+		editor.onShowFilePicker = onShowFilePicker;
+
+		editor.handleInput("\x1bF");
+		expect(onShowFilePicker).toHaveBeenCalledTimes(1);
+	});
+
+	it("triggers the file picker from a remapped action key instead of Alt+Shift+F", () => {
+		const editor = createEditor();
+		const onShowFilePicker = vi.fn();
+		editor.onShowFilePicker = onShowFilePicker;
+		editor.setActionKeys("app.file.picker", ["ctrl+y"]);
+
+		editor.handleInput(ctrl("y"));
+		expect(onShowFilePicker).toHaveBeenCalledTimes(1);
+
+		editor.handleInput("\x1bF");
+		expect(onShowFilePicker).toHaveBeenCalledTimes(1);
+	});
+});

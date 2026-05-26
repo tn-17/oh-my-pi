@@ -12,6 +12,7 @@ type ConfigurableEditorAction = Extract<
 	| "app.model.cycleBackward"
 	| "app.model.select"
 	| "app.model.selectTemporary"
+	| "app.file.picker"
 	| "app.tools.expand"
 	| "app.thinking.toggle"
 	| "app.editor.external"
@@ -38,6 +39,7 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.message.dequeue": ["alt+up"],
 	"app.clipboard.pasteImage": ["ctrl+v"],
 	"app.clipboard.copyPrompt": ["alt+shift+c"],
+	"app.file.picker": ["alt+shift+f"],
 };
 
 /**
@@ -59,6 +61,7 @@ export class CustomEditor extends Editor {
 	onSuspend?: () => void;
 	onShowHotkeys?: () => void;
 	onSelectModelTemporary?: () => void;
+	onShowFilePicker?: () => void;
 	/** Called when the configured copy-prompt shortcut is pressed. */
 	onCopyPrompt?: () => void;
 	/** Called when the configured image-paste shortcut is pressed. */
@@ -149,6 +152,11 @@ export class CustomEditor extends Editor {
 		// Intercept configured model selector shortcut
 		if (this.#matchesAction(data, "app.model.select") && this.onSelectModel) {
 			this.onSelectModel();
+			return;
+		}
+		// Intercept configured file picker shortcut
+		if (this.#matchesAction(data, "app.file.picker") && this.onShowFilePicker) {
+			this.onShowFilePicker();
 			return;
 		}
 
