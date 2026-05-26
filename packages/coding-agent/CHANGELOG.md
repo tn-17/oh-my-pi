@@ -62,6 +62,9 @@
 - Fixed concurrent Python evaluator tool calls to use per-run identifiers so tool responses and output are routed to the correct execution
 - Fixed the `search` tool argument validation to accept a single string `paths` value as a one-path search.
 
+### Added
+- Added a file picker overlay for browsing project paths and inserting the selected path into the editor
+- Selector mode can now open the file picker and insert backticked relative paths
 ## [15.4.0] - 2026-05-26
 
 ### Breaking Changes
