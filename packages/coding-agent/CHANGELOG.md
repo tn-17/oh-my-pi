@@ -228,6 +228,10 @@
 
 - Added OSC 8 terminal hyperlink support for file paths in tool output. When the terminal supports hyperlinks (kitty, Ghostty, WezTerm, iTerm2, Alacritty, VS Code) and the new `tui.hyperlinks` setting is `auto` (default) or `always`, OMP wraps file paths emitted by `read`, `find`, `search`, `edit`, `ast_grep`, and `ast_edit` renderers in `file:///abs/path` hyperlinks. `local://` and other fs-backed internal URLs resolve to their backing path. Set `tui.hyperlinks: off` to disable. ([#1244](https://github.com/can1357/oh-my-pi/issues/1244))
 
+- Added an interactive file picker shortcut (`Alt+Shift+F` by default) that lets you browse the current session working tree and insert a selected file's relative path into the draft prompt.
+
+### Changed
+- The interactive file picker now inserts the selected relative path in backticks
 ## [15.1.8] - 2026-05-20
 
 ### Fixed

@@ -171,6 +171,26 @@ export class SelectorController {
 		});
 	}
 
+	showFilePicker(): void {
+		const rootDir = this.ctx.sessionManager.getCwd();
+		this.showSelector(done => {
+			const component = new FilePickerComponent(
+				rootDir,
+				absolutePath => {
+					const relativePath = path.relative(rootDir, absolutePath).split(path.sep).join("/");
+					done();
+					this.ctx.editor.insertText(`\`${relativePath}\``);
+					this.ctx.ui.requestRender();
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+				() => this.ctx.ui.requestRender(),
+			);
+			return { component, focus: component };
+		});
+	}
 	/**
 	 * Show the Extension Control Center dashboard.
 	 * Replaces /status with a unified view of all providers and extensions.
