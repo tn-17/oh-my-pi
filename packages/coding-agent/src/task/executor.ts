@@ -532,6 +532,11 @@ function createSubagentSettings(baseSettings: Settings): Settings {
 		...snapshot,
 		"async.enabled": false,
 		"bash.autoBackground.enabled": false,
+
+		// Subagents run headless — there is no UI to confirm prompts against, so
+		// the parent task approval is the authorization boundary. Use yolo mode
+		// to preserve unattended subagent execution. User `tools.approval` policies still apply.
+		"tools.approvalMode": "yolo",
 	});
 }
 
@@ -1148,6 +1153,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (model?.contextWindow && model.contextWindow > 0) {
 				progress.contextWindow = model.contextWindow;
 			}
+			if (model) {
+				progress.resolvedModel = explicitThinkingLevel
+					? `${model.provider}/${model.id}:${resolvedThinkingLevel}`
+					: `${model.provider}/${model.id}`;
+			}
 			const effectiveThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
@@ -1606,6 +1616,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		contextTokens: progress.contextTokens,
 		contextWindow: progress.contextWindow,
 		modelOverride,
+		resolvedModel: progress.resolvedModel,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,

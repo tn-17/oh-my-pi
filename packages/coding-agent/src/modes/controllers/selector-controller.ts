@@ -30,7 +30,12 @@ import {
 import type { InteractiveModeContext } from "../../modes/types";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
-import { isSearchProviderPreference, setPreferredImageProvider, setPreferredSearchProvider } from "../../tools";
+import {
+	isImageProviderPreference,
+	isSearchProviderPreference,
+	setPreferredImageProvider,
+	setPreferredSearchProvider,
+} from "../../tools";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
@@ -396,7 +401,7 @@ export class SelectorController {
 				}
 				break;
 			case "providers.image":
-				if (value === "auto" || value === "openai" || value === "gemini" || value === "openrouter") {
+				if (isImageProviderPreference(value)) {
 					setPreferredImageProvider(value);
 				}
 				break;

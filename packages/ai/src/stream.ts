@@ -14,6 +14,7 @@ import type { AnthropicOptions } from "./providers/anthropic";
 import type { CursorOptions } from "./providers/cursor";
 import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
 import type { GoogleOptions } from "./providers/google";
+import { getVertexAccessToken } from "./providers/google-auth";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
 import { isKimiModel, streamKimi } from "./providers/kimi";
@@ -42,11 +43,13 @@ import {
 	streamOpenAIResponses,
 } from "./providers/register-builtins";
 import { isSyntheticModel, streamSynthetic } from "./providers/synthetic";
+import { streamXAIResponses } from "./providers/xai-responses";
 import type {
 	Api,
 	AssistantMessage,
 	AssistantMessageEvent,
 	Context,
+	FetchImpl,
 	Model,
 	OptionsForApi,
 	SimpleStreamOptions,
@@ -72,6 +75,24 @@ function hasVertexAdcCredentials(): boolean {
 	}
 	return cachedVertexAdcCredentialsExists;
 }
+function isGoogleVertexOpenAIModel(model: Model<Api>): boolean {
+	return (
+		model.provider === "google-vertex" &&
+		model.api === "openai-completions" &&
+		model.baseUrl.includes("/endpoints/openapi")
+	);
+}
+
+function createVertexOpenAIFetch(options: StreamOptions | undefined): FetchImpl {
+	const baseFetch = options?.fetch ?? fetch;
+	const vertexFetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+		const token = await getVertexAccessToken({ signal: options?.signal, fetch: baseFetch });
+		const headers = new Headers(init?.headers);
+		headers.set("Authorization", `Bearer ${token}`);
+		return baseFetch(input, { ...init, headers });
+	};
+	return Object.assign(vertexFetch, baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {});
+}
 
 type KeyResolver = string | (() => string | undefined);
 
@@ -82,12 +103,14 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	groq: "GROQ_API_KEY",
 	cerebras: "CEREBRAS_API_KEY",
 	xai: "XAI_API_KEY",
+	"xai-oauth": () => $pickenv("XAI_OAUTH_TOKEN", "XAI_API_KEY"),
 	fireworks: "FIREWORKS_API_KEY",
 	firepass: "FIREPASS_API_KEY",
 	openrouter: "OPENROUTER_API_KEY",
 	kilo: "KILO_API_KEY",
 	"vercel-ai-gateway": "AI_GATEWAY_API_KEY",
 	zai: "ZAI_API_KEY",
+	"zhipu-coding-plan": "ZHIPU_API_KEY",
 	mistral: "MISTRAL_API_KEY",
 	minimax: "MINIMAX_API_KEY",
 	"minimax-code": "MINIMAX_CODE_API_KEY",
@@ -119,8 +142,8 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 			return $env.GOOGLE_CLOUD_API_KEY;
 		}
 		const hasCredentials = hasVertexAdcCredentials();
-		const hasProject = !!($env.GOOGLE_CLOUD_PROJECT || $env.GCLOUD_PROJECT);
-		const hasLocation = !!$env.GOOGLE_CLOUD_LOCATION;
+		const hasProject = !!($env.GOOGLE_CLOUD_PROJECT || $env.GCP_PROJECT || $env.GCLOUD_PROJECT);
+		const hasLocation = !!($env.GOOGLE_VERTEX_LOCATION || $env.GOOGLE_CLOUD_LOCATION || $env.VERTEX_LOCATION);
 		if (hasCredentials && hasProject && hasLocation) {
 			return "<authenticated>";
 		}
@@ -222,7 +245,9 @@ export function stream<TApi extends Api>(
 	if (!apiKey) {
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
-	const providerOptions = { ...options, apiKey };
+	const providerOptions = isGoogleVertexOpenAIModel(model)
+		? { ...options, apiKey: "vertex-adc", fetch: createVertexOpenAIFetch(options as StreamOptions | undefined) }
+		: { ...options, apiKey };
 
 	const api: Api = model.api;
 	switch (api) {
@@ -237,8 +262,12 @@ export function stream<TApi extends Api>(
 		case "openai-completions":
 			return streamOpenAICompletions(model as Model<"openai-completions">, context, providerOptions as any);
 
-		case "openai-responses":
+		case "openai-responses": {
+			if (model.provider === "xai-oauth") {
+				return streamXAIResponses(model as Model<"openai-responses">, context, providerOptions as any);
+			}
 			return streamOpenAIResponses(model as Model<"openai-responses">, context, providerOptions as any);
+		}
 
 		case "azure-openai-responses":
 			return streamAzureOpenAIResponses(model as Model<"azure-openai-responses">, context, providerOptions as any);

@@ -1,7 +1,76 @@
 # Changelog
 
 ## [Unreleased]
+### Added
 
+- xAI Grok OAuth (SuperGrok Subscription) provider in `/login`. Loopback PKCE flow on `127.0.0.1:56121`; the token unlocks Grok-4.x chat. Ported from NousResearch/hermes-agent (MIT).
+- `XAI_OAUTH_TOKEN` environment variable accepted as a headless fallback for the xAI Grok OAuth provider.
+
+### Changed
+
+- `OpenAIResponsesOptions` gains four optional, provider-agnostic fields that adapter wrappers can use to compose provider-specific behavior on top of the generic transport: `includeEncryptedReasoning` (gates `include: ["reasoning.encrypted_content"]`; default `true`, preserves current behavior), `filterReasoningHistory` (strips replayed `type: "reasoning"` items from conversation history; default `false`), `headers` (merged onto the client's default headers), and `extraBody` (merged into the request payload).
+- The existing `XAI_API_KEY` path is unchanged — it continues to use the OpenAI-completions transport.
+
+## [15.5.6] - 2026-05-27
+### Added
+
+- Added `PI_CODEX_WEBSOCKET_MAX_IDLE_REUSE_MS` to control how long an idle Codex WebSocket stays eligible for reuse, with `0` disabling the check
+
+### Fixed
+
+- Fixed reused Codex WebSocket connections that had gone silent without activity to be dropped and replaced with a fresh handshake after the idle-reuse threshold, preventing stalled next requests
+- Fixed stale response frames left in the websocket queue from a completed turn so subsequent requests no longer process terminal frames from the previous response
+- Fixed websocket dead-socket detection to fail a stale connection when no inbound traffic or pong is observed after a ping timeout, improving recovery on runtimes that do not emit pong events
+
+## [15.5.5] - 2026-05-27
+
+### Added
+
+- Added `PI_CODEX_WEBSOCKET_PING_INTERVAL_MS` to configure the interval for Codex WebSocket protocol ping heartbeats
+- Added `PI_CODEX_WEBSOCKET_PONG_TIMEOUT_MS` to configure the Codex WebSocket pong timeout used to detect unresponsive connections
+- Added `PI_CODEX_WEBSOCKET_MESSAGE_QUEUE_CAPACITY` to configure the maximum buffered Codex WebSocket inbound queue size before transport fallback
+
+### Changed
+
+- Improved Codex WebSocket timeout diagnostics to include last event type and time since last progress event
+- Enhanced Codex WebSocket error classification to recognize ping, pong, send, and queue-overflow failures as retryable
+
+### Fixed
+
+- Fixed Codex WebSocket send failures by wrapping socket.send() in try-catch and surfacing errors as retryable transport errors
+- Fixed Codex WebSocket inbound queue overflow by adding capacity bounds and triggering fallback to SSE when exceeded
+- Fixed Codex WebSocket pong timeout detection by tracking pong events and failing the connection when no pong is received within the configured timeout
+- Fixed Anthropic streaming to suppress hallucinated meta-prompt thinking blocks (the recent "I don't see any current rewritten thinking..." regression). When the marker phrase `rewritten thinking` appears in a streamed thinking summary the block is collapsed to a plain `Thinking...` placeholder and its signature is dropped so subsequent turns can't re-anchor on the garbled chain.
+- Fixed Codex WebSocket silent stalls by adding protocol pings, inbound queue bounding, clearer idle-timeout diagnostics, and SDK retry clamping for first-event timeouts.
+
+## [15.5.0] - 2026-05-26
+### Added
+
+- Added `zhipu-coding-plan` provider for Zhipu (智谱) BigModel's domestic coding-plan SKU at `https://open.bigmodel.cn/api/coding/paas/v4`, with dynamic model discovery (`ZHIPU_API_KEY`), zai-format thinking, `reasoning_content` field, and OAuth login flow ([#1340](https://github.com/can1357/oh-my-pi/issues/1340)).
+
+### Removed
+
+- Removed the `pi-ai` CLI binary (`packages/ai/src/cli.ts`) and its `bin` entry. Use the in-process equivalent in the omp coding-agent CLI: `omp auth-broker login [provider]`, `omp auth-broker logout [provider]`, and `omp auth-broker list`. The library API (`AuthStorage.login()`, `getOAuthProviders()`, etc.) is unchanged.
+
+### Fixed
+
+- Fixed delayed `toolResult` emissions so real tool results are emitted in the correct assistant `toolCall` window after handoff/compaction, preventing out-of-order or orphaned tool results
+- Fixed delayed `toolResult` handling for aborted calls so a late real result is emitted instead of a synthetic `aborted` result for the same `toolCallId`
+- Fixed usage polling to disable credentials when OAuth refresh fails definitively (for example `invalid_grant`) and clear cached last-good usage data so stale reports no longer remain visible
+
+## [15.4.3] - 2026-05-26
+
+### Fixed
+
+- Fixed Google Vertex model discovery to use the project-scoped OpenAI-compatible model list so Vertex Model Garden models such as GLM and Claude are available through ADC auth ([#1412](https://github.com/can1357/oh-my-pi/issues/1412)).
+
+## [15.4.2] - 2026-05-26
+
+### Fixed
+
+- Fixed OpenCode Zen `big-pickle` follow-up requests replaying assistant tool-call turns without DeepSeek-required `reasoning_content`, which caused HTTP 400 errors in thinking mode.
+
+## [15.4.1] - 2026-05-26
 ### Added
 
 - Added `isOpenAICompletionsProgressChunk` export to identify real progress chunks vs. keepalives in OpenAI completions streams
@@ -12,6 +81,7 @@
 
 ### Changed
 
+- Enabled OpenAI Codex WebSocket streams to apply `streamIdleTimeoutMs` and `streamFirstEventTimeoutMs` from `StreamOptions` per request instead of fixed internal defaults
 - Changed stream idle watchdog implementation from `iterateUntilAbort` to `iterateWithIdleTimeout`, which now enforces maximum idle gaps between streamed events and distinguishes between first-event and steady-state timeouts
 - Changed Anthropic, OpenAI Responses, OpenAI Completions, Azure OpenAI Responses, and OpenAI Codex Responses providers to use the new idle-timeout iterator with per-provider progress predicates so empty keepalive frames cannot keep a stalled stream alive
 - Changed Codex WebSocket transport to reset `lastProgressAt` only on progress events (not keepalives), giving the 300s WS-internal idle ceiling the same liveness semantics as the SSE path
@@ -29,6 +99,7 @@
 
 ### Fixed
 
+- Fixed first-item timeout handling so `iterateWithIdleTimeout` no longer keeps first-event timers active after the source throws or the consumer stops before semantic progress
 - Fixed silent multi-hour hangs on Codex WebSocket subagent runs when the broker dropped frames between deltas by restoring per-provider stream watchdogs with progress-event filtering
 - Fixed z.ai/GLM-via-OpenRouter subagent stalls where no-op keepalive chunks reset the idle watchdog indefinitely by filtering non-progress items before resetting the deadline
 

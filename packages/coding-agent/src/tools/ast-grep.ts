@@ -1,13 +1,13 @@
 import * as path from "node:path";
+import { computeFileHash, formatHashlineHeader } from "@oh-my-pi/hashline";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { type AstFindMatch, astGrep } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import * as z from "zod/v4";
-import { getFileReadCache } from "../edit/file-read-cache";
+import { getFileSnapshotStore } from "../edit/file-snapshot-store";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import { computeFileHash, formatHashlineHeader } from "../hashline/hash";
 import type { Theme } from "../modes/theme/theme";
 import astGrepDescription from "../prompts/tools/ast-grep.md" with { type: "text" };
 import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
@@ -122,6 +122,7 @@ export interface AstGrepToolDetails {
 
 export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolDetails> {
 	readonly name = "ast_grep";
+	readonly approval = "read" as const;
 	readonly label = "AST Grep";
 	readonly summary = "Search code with AST patterns (structural grep)";
 	readonly description: string;
@@ -267,7 +268,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 					fileMatchCounts.set(relativePath, (fileMatchCounts.get(relativePath) ?? 0) + 1);
 				}
 				if (hashContext && cacheEntries.length > 0) {
-					getFileReadCache(this.session).recordSparse(hashContext.absolutePath, cacheEntries, {
+					getFileSnapshotStore(this.session).recordSparse(hashContext.absolutePath, cacheEntries, {
 						fileHash: hashContext.fileHash,
 					});
 				}

@@ -32,6 +32,31 @@ import { normalizeResponsesToolCallId } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 import { parseStreamingJson } from "../utils/json-parse";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
+export const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES: ReadonlySet<string> = new Set([
+	"response.created",
+	"response.output_item.added",
+	"response.reasoning_summary_part.added",
+	"response.reasoning_summary_text.delta",
+	"response.reasoning_summary_part.done",
+	"response.reasoning_text.delta",
+	"response.content_part.added",
+	"response.output_text.delta",
+	"response.refusal.delta",
+	"response.function_call_arguments.delta",
+	"response.function_call_arguments.done",
+	"response.custom_tool_call_input.delta",
+	"response.custom_tool_call_input.done",
+	"response.output_item.done",
+	"response.completed",
+	"response.failed",
+	"error",
+]);
+
+export function isOpenAIResponsesProgressEvent(event: unknown): boolean {
+	if (!event || typeof event !== "object") return false;
+	const type = (event as { type?: unknown }).type;
+	return typeof type === "string" && OPENAI_RESPONSES_PROGRESS_EVENT_TYPES.has(type);
+}
 
 export function encodeTextSignatureV1(id: string, phase?: TextSignatureV1["phase"]): string {
 	const payload: TextSignatureV1 = { v: 1, id };
@@ -745,12 +770,15 @@ export function applyResponsesReasoningParams<P extends OpenAI.Responses.Respons
 	options: ReasoningOptions | undefined,
 	messages: ResponseInput,
 	mapEffort?: (effort: string) => string,
+	includeEncryptedReasoning: boolean = true,
 ): void {
 	if (!model.reasoning) return;
 	// Always request encrypted reasoning content so reasoning items can be replayed in
 	// multi-turn conversations when store is false (items aren't persisted server-side, so
 	// we must include the full content). See: https://github.com/can1357/oh-my-pi/issues/41
-	params.include = ["reasoning.encrypted_content"];
+	if (includeEncryptedReasoning) {
+		params.include = ["reasoning.encrypted_content"];
+	}
 
 	if (options?.reasoning || options?.reasoningSummary !== undefined) {
 		const requested = options?.reasoning || "medium";

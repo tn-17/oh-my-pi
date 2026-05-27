@@ -451,6 +451,32 @@ function createSimpleOpenAICompletionsOptions(
 	};
 }
 
+function createSimpleOpenAIResponsesOptions(
+	providerId: Parameters<typeof getBundledModels>[0],
+	defaultBaseUrl: string,
+	config?: SimpleProviderConfig,
+): ModelManagerOptions<"openai-responses"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? defaultBaseUrl;
+	const references = createBundledReferenceMap<"openai-responses">(providerId);
+	return {
+		providerId,
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-responses",
+					provider: providerId,
+					baseUrl,
+					apiKey,
+					mapModel: (entry, defaults) => {
+						const reference = references.get(defaults.id);
+						return mapWithBundledReference(entry, defaults, reference);
+					},
+				}),
+		}),
+	};
+}
+
 function createSimpleAnthropicProviderOptions(
 	providerId: Parameters<typeof getBundledModels>[0],
 	defaultBaseUrlFallback: string,
@@ -586,6 +612,21 @@ export function xaiModelManagerOptions(config?: XaiModelManagerConfig): ModelMan
 	return createSimpleOpenAICompletionsOptions("xai", "https://api.x.ai/v1", config);
 }
 
+export interface XaiOAuthModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function xaiOAuthModelManagerOptions(
+	config?: XaiOAuthModelManagerConfig,
+): ModelManagerOptions<"openai-responses"> {
+	return createSimpleOpenAIResponsesOptions(
+		"xai-oauth" as Parameters<typeof getBundledModels>[0],
+		"https://api.x.ai/v1",
+		config,
+	);
+}
+
 // ---------------------------------------------------------------------------
 // 6.5 DeepSeek
 // ---------------------------------------------------------------------------
@@ -600,6 +641,70 @@ export function deepseekModelManagerOptions(
 ): ModelManagerOptions<"openai-completions"> {
 	return createSimpleOpenAICompletionsOptions("deepseek", "https://api.deepseek.com", config);
 }
+// ---------------------------------------------------------------------------
+// 6.7 Zhipu Coding Plan
+// ---------------------------------------------------------------------------
+
+export interface ZhipuCodingPlanModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function zhipuCodingPlanModelManagerOptions(
+	config?: ZhipuCodingPlanModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? "https://open.bigmodel.cn/api/paas/v4";
+	return {
+		providerId: "zhipu-coding-plan",
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-completions",
+					provider: "zhipu-coding-plan",
+					baseUrl,
+					apiKey,
+					mapModel: (
+						_entry: OpenAICompatibleModelRecord,
+						defaults: Model<"openai-completions">,
+						_context: OpenAICompatibleModelMapperContext<"openai-completions">,
+					): Model<"openai-completions"> => {
+						const id = defaults.id;
+						return {
+							...defaults,
+							reasoning: ZHIPU_REASONING_MODELS[id] === true || id.includes("thinking"),
+							input: ZHIPU_VISION_PATTERN.test(id) ? (["text", "image"] as const) : ["text"],
+							compat: {
+								thinkingFormat: "zai",
+								reasoningContentField: "reasoning_content",
+								supportsDeveloperRole: false,
+							},
+						};
+					},
+				}),
+		}),
+	};
+}
+
+// Reasoning-capable GLM models on the BigModel coding-plan SKU. Keep this
+// explicit rather than regex-matching `glm-[45]\.\d` so newly-added integers
+// like `glm-5` / `glm-5-turbo` are covered and unrelated future SKUs (e.g.
+// `glm-5-preview`) do not silently flip into thinking mode.
+const ZHIPU_REASONING_MODELS: Readonly<Record<string, true>> = {
+	"glm-4.5": true,
+	"glm-4.5-air": true,
+	"glm-4.6": true,
+	"glm-4.7": true,
+	"glm-5": true,
+	"glm-5-turbo": true,
+	"glm-5.1": true,
+};
+
+// Vision-capable GLM models follow the `glm-<N>[.<N>]v[-<variant>]` shape
+// (e.g. `glm-4v`, `glm-4.5v`, `glm-4v-plus`). The previous `id.includes("v")`
+// check matched anything with a `v` — including the non-vision `glm-5-preview`.
+const ZHIPU_VISION_PATTERN = /^glm-[45](?:\.\d+)?v(?:-|$)/;
+
 // ---------------------------------------------------------------------------
 // 7.5 Fireworks
 // ---------------------------------------------------------------------------
@@ -2184,6 +2289,14 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDe
 			},
 		},
 	),
+	// --- Zhipu Coding Plan ---
+	openAiCompletionsDescriptor("zhipu-coding-plan", "zhipu-coding-plan", "https://open.bigmodel.cn/api/paas/v4", {
+		compat: {
+			thinkingFormat: "zai",
+			reasoningContentField: "reasoning_content",
+			supportsDeveloperRole: false,
+		},
+	}),
 ];
 
 const filterActiveToolCallModels = (_id: string, m: ModelsDevModel): boolean => {

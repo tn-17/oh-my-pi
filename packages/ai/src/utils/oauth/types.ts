@@ -48,9 +48,11 @@ export type OAuthProvider =
 	| "venice"
 	| "vercel-ai-gateway"
 	| "vllm"
+	| "xai-oauth"
 	| "xiaomi"
 	| "zenmux"
-	| "zai";
+	| "zai"
+	| "zhipu-coding-plan";
 
 export type OAuthProviderId = OAuthProvider | (string & {});
 

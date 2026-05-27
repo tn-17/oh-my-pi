@@ -957,6 +957,16 @@ function b() {
 			expect(result.details?.timeoutSeconds).toBe(300);
 		});
 
+		it("should record wall time in text content and details", async () => {
+			const result = await bashTool.execute("test-call-walltime", { command: "echo wt" });
+
+			const output = getTextOutput(result);
+			expect(output).toContain("wt");
+			expect(output).toMatch(/Wall time: \d+\.\d{2} seconds/);
+			expect(typeof result.details?.wallTimeMs).toBe("number");
+			expect(result.details?.wallTimeMs).toBeGreaterThanOrEqual(0);
+		});
+
 		it("should expose built-in interceptor defaults truthfully", () => {
 			const defaultSettings = Settings.isolated({ "bashInterceptor.enabled": true });
 			const explicitEmptySettings = Settings.isolated({
@@ -1673,13 +1683,9 @@ function b() {
 				hidden: true,
 			});
 
-			const outputLines = getTextOutput(result)
-				.split("\n")
-				.map(line => line.trim())
-				.filter(Boolean);
-
-			expect(outputLines).toContain("visible.txt");
-			expect(outputLines).toContain(".secret/hidden.txt");
+			const files = (result.details?.files ?? []).slice().sort();
+			expect(files).toContain("visible.txt");
+			expect(files).toContain(".secret/hidden.txt");
 		});
 
 		it("should respect .gitignore", async () => {
@@ -1717,12 +1723,7 @@ function b() {
 				paths: [`${testDir}/**/auth-actions.spec.ts`],
 			});
 
-			const outputLines = getTextOutput(result)
-				.split("\n")
-				.map(line => line.trim())
-				.filter(Boolean);
-
-			expect(outputLines).toEqual(["z/auth-actions.spec.ts", "a/auth-actions.spec.ts"]);
+			expect(result.details?.files).toEqual(["z/auth-actions.spec.ts", "a/auth-actions.spec.ts"]);
 		});
 
 		it("should render nested glob results relative to the session cwd", async () => {
@@ -1734,12 +1735,7 @@ function b() {
 				paths: ["apps/daemon/src/**/daemon-telemetry.ts"],
 			});
 
-			const outputLines = getTextOutput(result)
-				.split("\n")
-				.map(line => line.trim())
-				.filter(Boolean);
-
-			expect(outputLines).toEqual(["apps/daemon/src/telemetry/daemon-telemetry.ts"]);
+			expect(result.details?.files).toEqual(["apps/daemon/src/telemetry/daemon-telemetry.ts"]);
 		});
 
 		it("should not double-prefix multi-pattern results under a shared base", async () => {
@@ -1754,13 +1750,8 @@ function b() {
 				paths: ["apps/daemon/src/**/*.ts", "apps/client/src/**/*.ts"],
 			});
 
-			const outputLines = getTextOutput(result)
-				.split("\n")
-				.map(line => line.trim())
-				.filter(Boolean)
-				.sort();
-
-			expect(outputLines).toEqual(["apps/client/src/client.ts", "apps/daemon/src/daemon.ts"]);
+			const files = (result.details?.files ?? []).slice().sort();
+			expect(files).toEqual(["apps/client/src/client.ts", "apps/daemon/src/daemon.ts"]);
 		});
 
 		it("should not disable gitignore after an ignored broad hidden-file search finds no matches", async () => {
@@ -1781,6 +1772,33 @@ function b() {
 			expect(output).not.toContain(".env.local");
 			expect(output).not.toContain(".env.generated");
 			expect(elapsedMs).toBeLessThan(1000);
+		});
+
+		it("should return directories alongside files with a trailing slash", async () => {
+			fs.mkdirSync(path.join(testDir, "pkg"));
+			fs.mkdirSync(path.join(testDir, "pkg", "nested"));
+			fs.writeFileSync(path.join(testDir, "pkg", "file.txt"), "f");
+			fs.writeFileSync(path.join(testDir, "pkg", "nested", "deep.txt"), "d");
+
+			const result = await findTool.execute("test-call-14f", {
+				paths: [`${testDir}/pkg/**/*`],
+			});
+
+			const files = (result.details?.files ?? []).slice().sort();
+			expect(files).toEqual(["pkg/file.txt", "pkg/nested/", "pkg/nested/deep.txt"]);
+		});
+
+		it("should match a directory by glob and emit it with trailing slash", async () => {
+			fs.mkdirSync(path.join(testDir, "alpha", "tests"), { recursive: true });
+			fs.mkdirSync(path.join(testDir, "beta", "tests"), { recursive: true });
+			fs.writeFileSync(path.join(testDir, "alpha", "tests", "a.ts"), "a");
+
+			const result = await findTool.execute("test-call-14g", {
+				paths: [`${testDir}/**/tests`],
+			});
+
+			const files = (result.details?.files ?? []).slice().sort();
+			expect(files).toEqual(["alpha/tests/", "beta/tests/"]);
 		});
 	});
 });

@@ -60,7 +60,6 @@ import {
 } from "./extensibility/custom-commands";
 import { discoverAndLoadCustomTools } from "./extensibility/custom-tools";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "./extensibility/custom-tools/types";
-import { CustomToolAdapter } from "./extensibility/custom-tools/wrapper";
 import {
 	discoverAndLoadExtensions,
 	type ExtensionContext,
@@ -130,6 +129,7 @@ import {
 	FindTool,
 	getSearchTools,
 	HIDDEN_TOOLS,
+	isImageProviderPreference,
 	isSearchProviderPreference,
 	type LspStartupServerInfo,
 	loadSshTool,
@@ -149,6 +149,7 @@ import { ToolContextStore } from "./tools/context";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { queueResolveHandler } from "./tools/resolve";
+import { ttsTool } from "./tools/tts";
 import { EventBus } from "./utils/event-bus";
 import { buildNamedToolChoice } from "./utils/tool-choice";
 import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
@@ -343,6 +344,9 @@ export interface CreateAgentSessionOptions {
 	 * `@opentelemetry/api` package returns a no-op tracer in that case.
 	 */
 	telemetry?: AgentTelemetryConfig;
+
+	/** Whether to auto-approve all tool calls (--auto-approve CLI flag). Default: false */
+	autoApprove?: boolean;
 }
 
 /** Result from createAgentSession */
@@ -835,7 +839,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// buffer — so we can't rely on it to catch startup events for the extension runner.
 	const startupCredentialDisabledEvents: CredentialDisabledEvent[] = [];
 	let credentialDisabledTarget: ExtensionRunner | undefined;
-	let unsubscribeCredentialDisabled: (() => void) | undefined = authStorage.onCredentialDisabled(event => {
+	const unsubscribeCredentialDisabled: (() => void) | undefined = authStorage.onCredentialDisabled(event => {
 		if (credentialDisabledTarget) {
 			// Discard return: any handler error is routed through runner.onError listeners.
 			void credentialDisabledTarget.emitCredentialDisabled(event);
@@ -891,12 +895,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	const imageProvider = settings.get("providers.image");
-	if (
-		imageProvider === "auto" ||
-		imageProvider === "openai" ||
-		imageProvider === "gemini" ||
-		imageProvider === "openrouter"
-	) {
+	if (isImageProviderPreference(imageProvider)) {
 		setPreferredImageProvider(imageProvider);
 	}
 
@@ -1317,6 +1316,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			customTools.push(...(imageGenTools as unknown as CustomTool[]));
 		}
 
+		if (settings.get("tts.enabled")) {
+			customTools.push(ttsTool as unknown as CustomTool);
+		}
+
 		// Add web search tools
 		if (options.toolNames?.includes("web_search")) {
 			customTools.push(...getSearchTools());
@@ -1455,29 +1458,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 
-		let extensionRunner: ExtensionRunner | undefined;
-		if (extensionsResult.extensions.length > 0) {
-			extensionRunner = new ExtensionRunner(
-				extensionsResult.extensions,
-				extensionsResult.runtime,
-				cwd,
-				sessionManager,
-				modelRegistry,
-			);
-		}
+		// The runner is created unconditionally — even with zero extensions loaded — because the
+		// `ExtensionToolWrapper` installed below is the only place the per-tool approval gate runs.
+		// A conditional runner means the approval system silently disappears for users with no
+		// extensions, contradicting non-yolo `tools.approvalMode` settings without feedback.
+		// (Today `createAutoresearchExtension` is unconditionally pushed below, so this scenario
+		// is unreachable; the unconditional construction makes that invariant explicit instead of
+		// implicit, so a future change to make autoresearch optional cannot silently re-open the hole.)
+		const extensionRunner: ExtensionRunner = new ExtensionRunner(
+			extensionsResult.extensions,
+			extensionsResult.runtime,
+			cwd,
+			sessionManager,
+			modelRegistry,
+		);
 
-		if (extensionRunner) {
-			credentialDisabledTarget = extensionRunner;
-			for (const event of startupCredentialDisabledEvents.splice(0)) {
-				// Discard return: any handler error is routed through runner.onError listeners.
-				void extensionRunner.emitCredentialDisabled(event);
-			}
-		} else {
-			// No runner to forward to; release our subscription. The embedder's own
-			// onCredentialDisabled (if any) keeps firing through its own subscription.
-			startupCredentialDisabledEvents.length = 0;
-			unsubscribeCredentialDisabled?.();
-			unsubscribeCredentialDisabled = undefined;
+		credentialDisabledTarget = extensionRunner;
+		for (const event of startupCredentialDisabledEvents.splice(0)) {
+			// Discard return: any handler error is routed through runner.onError listeners.
+			void extensionRunner.emitCredentialDisabled(event);
 		}
 
 		const getSessionContext = () => ({
@@ -1490,38 +1489,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				session.abort();
 			},
 			settings,
+			autoApprove: options.autoApprove ?? false,
 		});
 		const toolContextStore = new ToolContextStore(getSessionContext);
 
-		const registeredTools = extensionRunner?.getAllRegisteredTools() ?? [];
-		let wrappedExtensionTools: Tool[];
-
-		if (extensionRunner) {
-			// With extension runner: convert CustomTools to ToolDefinitions and wrap all together
-			const allCustomTools = [
-				...registeredTools,
-				...(options.customTools?.map(tool => {
-					const definition = isCustomTool(tool) ? customToolToDefinition(tool) : tool;
-					return { definition, extensionPath: "<sdk>" };
-				}) ?? []),
-			];
-			wrappedExtensionTools = wrapRegisteredTools(allCustomTools, extensionRunner);
-		} else {
-			// Without extension runner: wrap CustomTools directly with CustomToolAdapter
-			// ToolDefinition items require ExtensionContext and cannot be used without a runner
-			const customToolContext = (): CustomToolContext => ({
-				sessionManager,
-				modelRegistry,
-				model: agent?.state.model,
-				isIdle: () => !session?.isStreaming,
-				hasQueuedMessages: () => (session?.queuedMessageCount ?? 0) > 0,
-				abort: () => session?.abort(),
-				settings,
-			});
-			wrappedExtensionTools = (options.customTools ?? [])
-				.filter(isCustomTool)
-				.map(tool => CustomToolAdapter.wrap(tool, customToolContext));
-		}
+		const registeredTools = extensionRunner.getAllRegisteredTools();
+		const allCustomTools = [
+			...registeredTools,
+			...(options.customTools?.map(tool => {
+				const definition = isCustomTool(tool) ? customToolToDefinition(tool) : tool;
+				return { definition, extensionPath: "<sdk>" };
+			}) ?? []),
+		];
+		const wrappedExtensionTools: Tool[] = wrapRegisteredTools(allCustomTools, extensionRunner);
 
 		// All built-in tools are active (conditional tools like git/ask return null from factory if disabled)
 		const toolRegistry = new Map<string, Tool>();
@@ -1537,17 +1517,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		for (const tool of wrappedExtensionTools) {
 			toolRegistry.set(tool.name, tool);
 		}
-		if (extensionRunner) {
-			for (const tool of toolRegistry.values()) {
-				toolRegistry.set(tool.name, new ExtensionToolWrapper(tool, extensionRunner));
-			}
+		// Wrap every tool with `ExtensionToolWrapper` so the per-tool approval gate runs on every
+		// call site, regardless of whether any user extensions are loaded. See the runner-construction
+		// comment above for the safety invariant this enforces.
+		for (const tool of toolRegistry.values()) {
+			toolRegistry.set(tool.name, new ExtensionToolWrapper(tool, extensionRunner));
 		}
 		if (model?.provider === "cursor") {
 			toolRegistry.delete("edit");
 		}
 
+		// `resolve` is hidden but must stay in the registry whenever any code path can invoke it:
+		// either a deferrable tool stages a preview action, or plan mode installs a standing handler
+		// that consumes `resolve { action: "apply" }` to submit the plan for approval (issue #1428).
+		// Dropping it on read-only sessions (e.g. plan-mode toolset `read`, `search`, `find`,
+		// `web_search`) leaves plan mode unable to exit through the intended path.
 		const hasDeferrableTools = Array.from(toolRegistry.values()).some(tool => tool.deferrable === true);
-		if (!hasDeferrableTools) {
+		const planModeAvailable = settings.get("plan.enabled");
+		const needsResolveTool = hasDeferrableTools || planModeAvailable;
+		if (!needsResolveTool) {
 			toolRegistry.delete("resolve");
 		} else if (!toolRegistry.has("resolve")) {
 			const resolveTool = await logger.time("createTools:resolve:session", HIDDEN_TOOLS.resolve, toolSession);
@@ -1564,7 +1552,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			})) as unknown as AgentTool | null;
 			if (!sshTool) return null;
 			const wrapped = wrapToolWithMetaNotice(sshTool);
-			return (extensionRunner ? new ExtensionToolWrapper(wrapped, extensionRunner) : wrapped) as AgentTool;
+			return new ExtensionToolWrapper(wrapped, extensionRunner) as AgentTool;
 		};
 
 		let cursorEventEmitter: ((event: AgentEvent) => void) | undefined;
@@ -1658,9 +1646,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
-		const requestedToolNames =
-			(options.toolNames ? [...new Set(options.toolNames.map(name => name.toLowerCase()))] : undefined) ??
-			toolNamesFromRegistry;
+		const explicitlyRequestedToolNames = options.toolNames
+			? [...new Set(options.toolNames.map(name => name.toLowerCase()))]
+			: undefined;
+		// When `requireYieldTool` is set, the subagent's prompts and idle-reminders demand a
+		// `yield` call to terminate. The tool registry already includes `yield` (see
+		// `createTools`), but an explicit `toolNames` list would otherwise drop it from the
+		// active set — leaving the model unable to satisfy the contract. Mirror the same
+		// invariant `parseAgentFields` enforces on frontmatter `tools`.
+		if (
+			options.requireYieldTool === true &&
+			explicitlyRequestedToolNames &&
+			!explicitlyRequestedToolNames.includes("yield")
+		) {
+			explicitlyRequestedToolNames.push("yield");
+		}
+		const requestedToolNames = explicitlyRequestedToolNames ?? toolNamesFromRegistry;
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
 		const requestedToolNameSet = new Set(normalizedRequested);
 		// Effective discovery mode: tools.discoveryMode takes precedence; mcp.discoveryMode is back-compat alias.
@@ -1811,21 +1812,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (!obfuscator?.hasSecrets()) return converted;
 			return obfuscateMessages(obfuscator, converted);
 		};
-		const transformContext = extensionRunner
-			? async (messages: AgentMessage[], _signal?: AbortSignal) => {
-					return await extensionRunner.emitContext(messages);
-				}
-			: undefined;
-		const onPayload = extensionRunner
-			? async (payload: unknown, _model?: Model) => {
-					return await extensionRunner.emitBeforeProviderRequest(payload);
-				}
-			: undefined;
-		const onResponse: SimpleStreamOptions["onResponse"] | undefined = extensionRunner
-			? async (response, model) => {
-					await extensionRunner.emitAfterProviderResponse(response, model);
-				}
-			: undefined;
+		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal) => {
+			return await extensionRunner.emitContext(messages);
+		};
+		const onPayload = async (payload: unknown, _model?: Model) => {
+			return await extensionRunner.emitBeforeProviderRequest(payload);
+		};
+		const onResponse: SimpleStreamOptions["onResponse"] = async (response, model) => {
+			await extensionRunner.emitAfterProviderResponse(response, model);
+		};
 
 		const setToolUIContext = (uiContext: ExtensionUIContext, hasUI: boolean) => {
 			toolContextStore.setUIContext(uiContext, hasUI);

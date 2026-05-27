@@ -1,3 +1,4 @@
+import type { InMemorySnapshotStore } from "@oh-my-pi/hashline";
 import type { AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolChoice } from "@oh-my-pi/pi-ai";
 import { $env, $flag, logger } from "@oh-my-pi/pi-utils";
@@ -91,6 +92,7 @@ export * from "./search";
 export * from "./search-tool-bm25";
 export * from "./ssh";
 export * from "./todo-write";
+export * from "./tts";
 export * from "./write";
 export * from "./yield";
 
@@ -230,11 +232,11 @@ export interface ToolSession {
 	/** Set or clear active checkpoint state. */
 	setCheckpointState?: (state: CheckpointState | null) => void;
 
-	/** Per-session cache of file contents as last shown to the model by
-	 *  `read`/`search`. Used by hashline anchor-stale recovery to reconstruct
-	 *  the version the model authored anchors against when the file changed
-	 *  out-of-band. Lazily initialized by `getFileReadCache`. */
-	fileReadCache?: import("../edit/file-read-cache").FileReadCache;
+	/** Per-session snapshot store of file contents as last shown to the model
+	 *  by `read`/`search`. Used by hashline anchor-stale recovery to
+	 *  reconstruct the version the model authored anchors against when the
+	 *  file changed out-of-band. Lazily initialized by `getFileSnapshotStore`. */
+	fileSnapshotStore?: InMemorySnapshotStore;
 
 	/** Per-session log of unresolved git merge conflict regions surfaced by
 	 *  `read`. Each entry gets a stable id N referenced by `write conflict://N`

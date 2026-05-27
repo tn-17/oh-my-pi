@@ -9,7 +9,7 @@
   - `packages/coding-agent/src/utils/edit-mode.ts` — selects active edit mode
   - `packages/coding-agent/src/hashline/grammar.lark` — custom-tool grammar for hashline mode
   - `packages/coding-agent/src/hashline/input.ts` — splits `¶PATH` sections
-  - `packages/coding-agent/src/hashline/parser.ts` — parses op-prefixed edits and verbatim payload lines
+  - `packages/coding-agent/src/hashline/executor.ts` / `tokenizer.ts` — parses op-prefixed edits and `+`-prefixed payload continuation lines
   - `packages/coding-agent/src/hashline/apply.ts` — validates anchors and applies edits
   - `packages/coding-agent/src/hashline/anchors.ts` — stale-anchor mismatch formatting
   - `packages/coding-agent/src/hashline/recovery.ts` — cache-based stale-anchor recovery
@@ -37,7 +37,7 @@ Patch language inside `input`:
 - Single-line replace sugar: `A:[payload]` means `A-A:[payload]`
 - Delete range: `A-B!`
 - Single-line delete sugar: `A!` means `A-A!`
-- **Payload semantics:** the first payload line is whatever follows the sigil on the op line itself; additional payload lines follow on subsequent lines and append after the inline first line. An empty inline (just the sigil followed by a newline) means the first payload line is empty. So bare `A↑` / `A↓` insert one blank line, and bare `A:` / `A-B:` replace the line/range with one blank line. But `A↓\nfoo` inserts blank-then-`foo`, not just `foo` — for a single-line insert, put `foo` inline as `A↓foo`.
+- **Payload semantics:** the first payload line may follow the sigil on the op line itself. Additional payload lines must be on subsequent lines prefixed with `+`; that delimiter is stripped before writing. Use `+` alone for an empty payload line, and `++text` to write a payload line that begins with `+text`. Bare `A↑` / `A↓` insert one blank line, and bare `A:` / `A-B:` replace the line/range with one blank line.
 - `!` deletes and forbids payload.
 - Read lines like `84:content` are already valid single-line replacements.
 - Special anchors: `BOF`, `EOF` (both support inline payload, e.g. `BOF↓export const done = true;`).
@@ -71,15 +71,15 @@ Warnings:
 - While the model is still typing arguments, the TUI can compute a diff preview with `packages/coding-agent/src/edit/streaming.ts`; that preview is not a deferred action and does not block execution.
 
 ## Flow
-1. `EditTool.execute()` in `packages/coding-agent/src/edit/index.ts` resolves the active mode. Default is `hashline`; `customFormat` exposes `packages/coding-agent/src/hashline/grammar.lark` with `$HFILE_HASH$` / `$HOP_INSERT_BEFORE$` / `$HOP_INSERT_AFTER$` / `$HOP_REPLACE$` / `$HOP_CHARS$` / `$HFILE$` placeholders filled from `packages/coding-agent/src/hashline/hash.ts`.
+1. `EditTool.execute()` in `packages/coding-agent/src/edit/index.ts` resolves the active mode. Default is `hashline`; `customFormat` exposes `packages/hashline/src/grammar.lark` as a constant string with op sigils and the section-header `¶` inlined.
 2. `executeHashlineSingle()` in `packages/coding-agent/src/hashline/execute.ts` splits the raw `input` into `¶PATH#HASH` / `¶PATH` sections with `splitHashlineInputs()`.
 3. If multiple sections target the same path, `mergeSamePathSections()` concatenates them before execution so every op still refers to the original file snapshot.
 4. Multi-section calls run a preflight pass (`preflightHashlineSection()`): parse ops, enforce plan-mode write rules, load the current file, reject anchor-scoped edits against missing files, reject auto-generated files, apply edits in memory, and fail if the result is a no-op. This prevents partial batches.
-5. `parseHashlineWithWarnings()` in `packages/coding-agent/src/hashline/parser.ts` tokenizes the diff body:
-   - ignores blank lines and optional `*** Begin Patch`
+5. `parseHashline()` in `packages/coding-agent/src/hashline/executor.ts` tokenizes the diff body:
+   - ignores raw blank lines and optional `*** Begin Patch`
    - stops at `*** End Patch`
    - stops at `*** Abort` and emits `ABORT_WARNING`
-   - turns `↓` / `↑` payload runs (inline plus subsequent lines) into one `insert` edit per payload line
+   - turns `↓` / `↑` payload runs (inline plus `+`-prefixed subsequent lines) into one `insert` edit per payload line
    - turns `A-B:` with payload into inserts before `A`, then deletes for `A-B`
    - turns `A-B!` into one `delete` edit per line in the range; payload is forbidden
 6. `executeHashlineSingle()` computes the current file hash before applying anchored edits. If it differs from the section `#HASH`, recovery tries the read/search snapshot cache before any write.
@@ -103,7 +103,7 @@ Warnings:
 - `patch` — structured JSON diff-hunk mode (`packages/coding-agent/src/edit/modes/patch.ts`).
 - `apply_patch` — freeform Codex-style `*** Begin Patch` envelope, internally expanded into patch-mode entries (`packages/coding-agent/src/edit/modes/apply-patch.ts`).
 
-Hashline op examples (single-line payloads are inline; multi-line payloads continue on subsequent lines):
+Hashline op examples (single-line payloads are inline; multi-line payloads continue on `+`-prefixed subsequent lines):
 
 ```text
 ¶src/a.ts#1a2b
@@ -123,7 +123,7 @@ Hashline op examples (single-line payloads are inline; multi-line payloads conti
 ```text
 ¶src/a.ts#1a2b
 4-5:const clean = (name || DEF).trim();
-return clean.length === 0 ? DEF : clean.toUpperCase();
++return clean.length === 0 ? DEF : clean.toUpperCase();
 ```
 
 ```text
@@ -210,6 +210,8 @@ Multi-file example:
   - `line N: range A-B ends before it starts.`
 - Payload forbidden for `!`:
   - `line N: ! deletes only. Payload is forbidden after !; use : to replace.`
+- Missing `+` on a continuation line:
+  - `line N: payload continuation lines must start with +.`
 - Stray payload line:
   - `line N: payload line has no preceding ↑, ↓, :, or ! operation.`
 - Unknown op:
@@ -227,6 +229,7 @@ Multi-file example:
 - `read` and `search` are the authoritative source of section hashes. Copy `¶PATH#HASH`; op lines use bare line numbers and do not want the trailing `:TEXT`.
 - Multi-op patches are parsed against the original file snapshot. Do not renumber later anchors after earlier ops; `applyHashlineEdits()` buckets and applies them bottom-up.
 - Failed hand-edits often come from sequentially shifting later anchors inside the same patch. Treat every op as using the line numbers from the original section header.
+- Two consecutive `A-B:` ops on the *identical* range in the same hunk are coalesced: the second op's payload wins and the first is dropped (a "Detected an identical-range before/after replace pair" warning is appended). Other overlap shapes — different ranges, `A-B:` overlapping a `N!`/`N:`, or two `!` deletes on the same line — still throw `line N: anchor line X is already targeted by the :/! op on line Y`. The coalesce only fires while the first op is still pending; cross-hunk duplicates still throw.
 - `A-B:` is not a primitive replace in the parser. With payload, it expands to inserts before `A` plus deletes for `A-B`. `A-B!` is the direct delete form. Bare `A:` / `A-B:` (no payload) replaces with a single blank line; bare `↑` / `↓` insert a blank line.
 - Inline payload tip: trailing whitespace on the op line is trimmed. To preserve trailing spaces in the inserted/replacement content, put that content on the next line instead of inline.
 - `computeFileHash()` normalizes CR characters and trailing whitespace before hashing. The section survives line-ending and trailing-space-only changes, but not substantive file edits.

@@ -9,6 +9,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
+import { keepaliveWhile } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	$env,
@@ -315,7 +316,7 @@ async function runInteractiveMode(
 	}
 
 	while (true) {
-		const input = await mode.getUserInput();
+		const input = await keepaliveWhile(mode.getUserInput());
 		await submitInteractiveInput(mode, session, input);
 	}
 }
@@ -529,6 +530,7 @@ async function buildSessionOptions(
 ): Promise<{ options: CreateAgentSessionOptions }> {
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
+		autoApprove: parsed.autoApprove ?? false,
 	};
 
 	// Auto-discover SYSTEM.md if no CLI system prompt provided
@@ -769,6 +771,11 @@ export async function runRootCommand(
 
 	const cwd = getProjectDir();
 	const settingsInstance = deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd }));
+	if (parsedArgs.approvalMode) {
+		// Runtime override (not persisted): every settings.get("tools.approvalMode") downstream
+		// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
+		settingsInstance.override("tools.approvalMode", parsedArgs.approvalMode);
+	}
 	if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
 		applyRpcDefaultSettingOverrides(settingsInstance);
 	}

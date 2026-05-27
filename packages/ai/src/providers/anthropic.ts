@@ -2,7 +2,10 @@ import * as nodeCrypto from "node:crypto";
 import * as fs from "node:fs";
 import { scheduler } from "node:timers/promises";
 import * as tls from "node:tls";
-import Anthropic, { type ClientOptions as AnthropicSdkClientOptions } from "@anthropic-ai/sdk";
+import Anthropic, {
+	APIConnectionTimeoutError as AnthropicConnectionTimeoutError,
+	type ClientOptions as AnthropicSdkClientOptions,
+} from "@anthropic-ai/sdk";
 import type {
 	ContentBlockParam,
 	MessageCreateParamsStreaming,
@@ -63,6 +66,7 @@ import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
 import { COMBINATOR_KEYS, NO_STRICT, toolWireSchema } from "../utils/schema";
 import { spillToDescription } from "../utils/schema/spill";
+import { createSdkStreamRequestOptions } from "../utils/sdk-stream-timeout";
 import { notifyRawSseEvent, wrapFetchForSseDebug } from "../utils/sse-debug";
 import {
 	buildCopilotDynamicHeaders,
@@ -543,6 +547,17 @@ function convertContentBlocks(
 
 	return blocks;
 }
+
+/**
+ * Marker phrase that Claude has been observed to hallucinate inside reasoning summaries
+ * (e.g. "I don't see any current rewritten thinking or next thinking to process. Could
+ * you provide..."). When this substring appears in a streamed thinking block we collapse
+ * the entire block to {@link BROKEN_THINKING_REPLACEMENT} and drop the signature so
+ * downstream UI/transcripts don't surface the meta-prompt and replay can't re-anchor on
+ * the garbled chain.
+ */
+const BROKEN_THINKING_MARKER = "rewritten thinking";
+const BROKEN_THINKING_REPLACEMENT = "Thinking...";
 
 export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
 export type AnthropicThinkingDisplay = "summarized" | "omitted";
@@ -1090,7 +1105,15 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			) & { index: number };
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
 			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
+			const requestTimeoutMs =
+				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0 ? firstEventTimeoutMs : undefined;
 			const blocks = output.content as Block[];
+			// Recent Claude releases occasionally hallucinate meta-prompts asking the operator
+			// to supply "rewritten thinking" / "next thinking" as reasoning content. The summary
+			// is useless and confuses the UI, so we collapse any thinking block whose stream
+			// contains the marker phrase down to a plain "Thinking..." placeholder and drop the
+			// (now invalid) signature so subsequent turns don't replay the garbled chain.
+			const suppressedThinkingBlocks = new WeakSet<Block>();
 			stream.push({ type: "start", partial: output });
 			// Retry loop for transient errors from the stream.
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
@@ -1101,19 +1124,39 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			while (true) {
 				activeAbortTracker = createAbortSourceTracker(options?.signal);
 				const { requestSignal } = activeAbortTracker;
-				const anthropicRequest = client.messages.create({ ...params, stream: true }, { signal: requestSignal });
+				const requestOptions = createSdkStreamRequestOptions(requestSignal, requestTimeoutMs);
+				const anthropicRequest = client.messages.create({ ...params, stream: true }, requestOptions);
 				let streamedReplayUnsafeContent = false;
 
 				try {
-					const {
-						events: anthropicStream,
-						response,
-						requestId,
-					} = await getAnthropicStreamResponse(
-						anthropicRequest,
-						requestSignal,
-						options?.client ? event => options?.onSseEvent?.(event, model) : undefined,
-					);
+					let requestTimeout: NodeJS.Timeout | undefined;
+					if (requestTimeoutMs !== undefined) {
+						requestTimeout = setTimeout(
+							() => activeAbortTracker.abortLocally(firstEventTimeoutAbortError),
+							requestTimeoutMs,
+						);
+					}
+					let anthropicStream: AsyncIterable<RawMessageStreamEvent>;
+					let response: Response;
+					let requestId: string | null;
+					try {
+						({
+							events: anthropicStream,
+							response,
+							requestId,
+						} = await getAnthropicStreamResponse(
+							anthropicRequest,
+							requestSignal,
+							options?.client ? event => options?.onSseEvent?.(event, model) : undefined,
+						));
+					} catch (error) {
+						if (error instanceof AnthropicConnectionTimeoutError && !activeAbortTracker.wasCallerAbort()) {
+							throw firstEventTimeoutAbortError;
+						}
+						throw error;
+					} finally {
+						if (requestTimeout !== undefined) clearTimeout(requestTimeout);
+					}
 					await notifyProviderResponse(options, response, model, requestId);
 					let sawEvent = false;
 					let sawMessageStart = false;
@@ -1225,7 +1268,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								const index = blocks.findIndex(b => b.index === event.index);
 								const block = blocks[index];
 								if (block && block.type === "thinking") {
+									if (suppressedThinkingBlocks.has(block)) continue;
 									block.thinking += event.delta.thinking;
+									if (block.thinking.includes(BROKEN_THINKING_MARKER)) {
+										suppressedThinkingBlocks.add(block);
+										block.thinking = BROKEN_THINKING_REPLACEMENT;
+										block.thinkingSignature = "";
+										continue;
+									}
 									stream.push({
 										type: "thinking_delta",
 										contentIndex: index,
@@ -1249,7 +1299,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							} else if (event.delta.type === "signature_delta") {
 								const index = blocks.findIndex(b => b.index === event.index);
 								const block = blocks[index];
-								if (block && block.type === "thinking") {
+								if (block && block.type === "thinking" && !suppressedThinkingBlocks.has(block)) {
 									block.thinkingSignature = block.thinkingSignature || "";
 									block.thinkingSignature += event.delta.signature;
 								}
@@ -1267,6 +1317,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "thinking") {
+									if (
+										!suppressedThinkingBlocks.has(block) &&
+										block.thinking.includes(BROKEN_THINKING_MARKER)
+									) {
+										suppressedThinkingBlocks.add(block);
+										block.thinking = BROKEN_THINKING_REPLACEMENT;
+										block.thinkingSignature = "";
+									}
 									stream.push({
 										type: "thinking_end",
 										contentIndex: index,

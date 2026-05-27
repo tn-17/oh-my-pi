@@ -2,23 +2,85 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+	type ApplyOptions,
+	applyEdits,
+	buildCompactDiffPreview as buildCompactHashlineDiffPreview,
+	computeFileHash,
+	detectLineEnding,
+	type Edit,
+	InMemorySnapshotStore as FileReadCache,
+	Filesystem,
+	MismatchError as HashlineMismatchError,
+	NotFoundError,
+	Patch,
+	Patcher,
+	type PatchSection,
+	parsePatch as parseHashline,
+	Recovery,
+	type SplitOptions,
+	type WriteResult,
+} from "@oh-my-pi/hashline";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
-	applyHashlineEdits,
-	buildCompactHashlineDiffPreview,
-	computeFileHash,
 	type ExecuteHashlineSingleOptions,
 	executeHashlineSingle,
-	FileReadCache,
 	generateDiffString,
-	getFileReadCache,
-	HashlineMismatchError,
+	getFileSnapshotStore as getFileReadCache,
 	hashlineEditParamsSchema,
-	parseHashline,
-	splitHashlineInput,
-	splitHashlineInputs,
-	tryRecoverHashlineWithCache,
 } from "@oh-my-pi/pi-coding-agent/edit";
+import * as z from "zod/v4";
+
+/**
+ * The test bodies were written against the legacy hashline API surface. The
+ * shims below project the new `@oh-my-pi/hashline` shapes onto the legacy
+ * names so production code can use the new names directly while we keep the
+ * pre-existing behavior assertions intact.
+ */
+function applyHashlineEdits(
+	text: string,
+	edits: readonly Edit[],
+	options: ApplyOptions = {},
+): { text: string; lines: string; firstChangedLine?: number; warnings?: string[] } {
+	const r = applyEdits(text, [...edits], options);
+	return { ...r, lines: r.text };
+}
+
+interface SectionView {
+	path: string;
+	fileHash?: string;
+	diff: string;
+}
+function toSectionView(section: PatchSection): SectionView {
+	return section.fileHash !== undefined
+		? { path: section.path, fileHash: section.fileHash, diff: section.diff }
+		: { path: section.path, diff: section.diff };
+}
+function splitHashlineInput(input: string, options: SplitOptions = {}): SectionView {
+	return toSectionView(Patch.parseSingle(input, options));
+}
+function splitHashlineInputs(input: string, options: SplitOptions = {}): SectionView[] {
+	return Patch.parse(input, options).sections.map(toSectionView);
+}
+
+function tryRecoverHashlineWithCache(args: {
+	cache: FileReadCache;
+	absolutePath: string;
+	currentText: string;
+	fileHash: string;
+	edits: readonly Edit[];
+	options?: ApplyOptions;
+}): { text: string; lines: string; firstChangedLine: number | undefined; warnings: string[] } | null {
+	const recovered = new Recovery(args.cache).tryRecover({
+		path: args.absolutePath,
+		currentText: args.currentText,
+		fileHash: args.fileHash,
+		edits: args.edits,
+		options: args.options,
+	});
+	return recovered ? { ...recovered, lines: recovered.text } : null;
+}
+
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 beforeAll(async () => {
@@ -26,7 +88,9 @@ beforeAll(async () => {
 	await Settings.init({ inMemory: true, cwd: process.cwd() });
 });
 
-const pl = (text: string): string => text;
+const repl = (text: string): string => `|${text}`;
+const above = (text: string): string => `↑${text}`;
+const below = (text: string): string => `↓${text}`;
 const outputSep = ":";
 const outputSepRe = ":";
 
@@ -84,93 +148,170 @@ function hashlineExecuteOptions(
 	};
 }
 
-describe("hashline parser — suffix-op syntax", () => {
+class PolicyFilesystem extends Filesystem {
+	#files = new Map<string, string>();
+	#blocked = new Set<string>();
+
+	constructor(initial: Iterable<readonly [string, string]>, blocked: Iterable<string>) {
+		super();
+		for (const [filePath, content] of initial) this.#files.set(filePath, content);
+		for (const filePath of blocked) this.#blocked.add(filePath);
+	}
+
+	async readText(filePath: string): Promise<string> {
+		const content = this.#files.get(filePath);
+		if (content === undefined) throw new NotFoundError(filePath);
+		return content;
+	}
+
+	async preflightWrite(filePath: string): Promise<void> {
+		if (this.#blocked.has(filePath)) throw new Error(`blocked write: ${filePath}`);
+	}
+
+	async writeText(filePath: string, content: string): Promise<WriteResult> {
+		this.#files.set(filePath, content);
+		return { text: content };
+	}
+
+	get(filePath: string): string | undefined {
+		return this.#files.get(filePath);
+	}
+}
+
+describe("hashline normalization", () => {
+	it("preserves the first newline style when restoring mixed-ending files", () => {
+		expect(detectLineEnding("a\r\nb\nc")).toBe("\r\n");
+		expect(detectLineEnding("a\nb\r\nc")).toBe("\n");
+	});
+});
+
+describe("hashline parser — range-anchor syntax", () => {
+	it("keeps parsed edits reusable across different target snapshots", () => {
+		const section = Patch.parseSingle(["¶a.ts", `${tag(2, "bbb")}:`, below("tail")].join("\n"));
+
+		expect(section.applyTo("aaa\nbbb").text).toBe("aaa\nbbb\ntail");
+		expect(section.applyTo("aaa\nbbb\nccc").text).toBe("aaa\nbbb\ntail\nccc");
+	});
+
 	const content = "aaa\nbbb\nccc";
 
 	it("inserts payload before/after a Lid, and at BOF/EOF", () => {
-		const diff = [`${tag(2, "bbb")}↑before b`, `${tag(2, "bbb")}↓after b`, "BOF↓top", "EOF↓tail"].join("\n");
+		const diff = [
+			`${tag(2, "bbb")}:`,
+			above("before b"),
+			below("after b"),
+
+			"BOF:",
+			below("top"),
+			"EOF:",
+			below("tail"),
+		].join("\n");
 		expect(applyDiff(content, diff)).toBe("top\naaa\nbefore b\nbbb\nafter b\nccc\ntail");
 	});
 
-	it("inserts after the final line via `ANCHOR↓` instead of falling off the file", () => {
-		const diff = `${tag(3, "ccc")}↓tail`;
+	it("inserts after the final line without falling off the file", () => {
+		const diff = [`${tag(3, "ccc")}:`, below("tail")].join("\n");
 		expect(applyDiff(content, diff)).toBe("aaa\nbbb\nccc\ntail");
 	});
 
-	it("deletes one line or an inclusive range with `!`", () => {
-		expect(applyDiff(content, `${sameLineRange(tag(2, "bbb"))}!`)).toBe("aaa\nccc");
-		expect(applyDiff(content, `${tag(2, "bbb")}-${tag(3, "ccc")}!`)).toBe("aaa");
+	it("deletes a line or range when the block has no payload rows", () => {
+		expect(applyDiff(content, `${sameLineRange(tag(2, "bbb"))}:`)).toBe("aaa\nccc");
+		expect(applyDiff(content, `${tag(2, "bbb")}-${tag(3, "ccc")}:`)).toBe("aaa");
 	});
 
-	it("blanks a line in place with `A:` when given an explicit empty payload", () => {
-		const explicit = `${sameLineRange(tag(2, "bbb"))}:`;
+	it("replaces a line with one blank when given an explicit empty replace payload", () => {
+		const explicit = [`${sameLineRange(tag(2, "bbb"))}:`, repl("")].join("\n");
 		expect(applyDiff(content, explicit)).toBe("aaa\n\nccc");
 	});
 
 	it("replaces one line or an inclusive range with payload lines", () => {
-		const single = `${tag(2, "bbb")}:BBB`;
+		const single = [`${tag(2, "bbb")}:`, repl("BBB")].join("\n");
 		expect(applyDiff(content, single)).toBe("aaa\nBBB\nccc");
 
-		const range = [`${tag(2, "bbb")}-${tag(3, "ccc")}:BBB`, pl("CCC")].join("\n");
+		const range = [`${tag(2, "bbb")}-${tag(3, "ccc")}:`, repl("BBB"), repl("CCC")].join("\n");
 		expect(applyDiff(content, range)).toBe("aaa\nBBB\nCCC");
 	});
 
 	it("treats single-anchor replace sugar as equivalent to an explicit one-line range", () => {
 		const anchor = tag(2, "bbb");
-		expect(parseHashline(`${anchor}:\nBBB`).edits).toEqual(parseHashline(`${anchor}-${anchor}:\nBBB`).edits);
-		expect(applyDiff(content, `${anchor}:\nBBB`)).toBe(applyDiff(content, `${anchor}-${anchor}:\nBBB`));
+		expect(parseHashline(`${anchor}:\n${repl("BBB")}\n${repl("CCC")}`).edits).toEqual(
+			parseHashline(`${anchor}-${anchor}:\n${repl("BBB")}\n${repl("CCC")}`).edits,
+		);
+		expect(applyDiff(content, `${anchor}:\n${repl("BBB")}\n${repl("CCC")}`)).toBe(
+			applyDiff(content, `${anchor}-${anchor}:\n${repl("BBB")}\n${repl("CCC")}`),
+		);
 	});
 
-	it("accepts an inline payload on the op line as the first/only payload line", () => {
+	it("rejects inline payload on anchor rows", () => {
 		const anchor = tag(2, "bbb");
-		expect(applyDiff(content, `${anchor}↓NEW`)).toBe("aaa\nbbb\nNEW\nccc");
-		expect(applyDiff(content, `${anchor}↑NEW`)).toBe("aaa\nNEW\nbbb\nccc");
-		expect(applyDiff(content, `${anchor}:NEW`)).toBe("aaa\nNEW\nccc");
+		for (const diff of [`${anchor}:NEW`, `${anchor}-${tag(3, "ccc")}:NEW`, "BOF:NEW", "EOF:NEW"]) {
+			expect(() => parseHashline(diff)).toThrow(/Inline payload on the anchor line is rejected/);
+		}
 	});
 
-	it("combines an inline payload with subsequent payload lines on insert ops", () => {
+	it("routes interleaved payload rows to stable above, replace, and below buckets", () => {
+		const diff = [
+			`${tag(2, "bbb")}:`,
+			below("below 1"),
+			above("above 1"),
+			repl("BBB"),
+			above("above 2"),
+			below("below 2"),
+		].join("\n");
+		expect(applyDiff(content, diff)).toBe("aaa\nabove 1\nabove 2\nBBB\nbelow 1\nbelow 2\nccc");
+	});
+
+	it("preserves the anchor when only above/below payload rows are present", () => {
+		const diff = [`${tag(2, "bbb")}:`, above("before"), below("after")].join("\n");
+		expect(applyDiff(content, diff)).toBe("aaa\nbefore\nbbb\nafter\nccc");
+	});
+
+	it("escapes literal leading payload sigils by doubling them", () => {
+		const diff = [`${tag(2, "bbb")}:`, repl("|literal"), above("↑literal"), below("↓literal")].join("\n");
+		expect(applyDiff(content, diff)).toBe("aaa\n↑literal\n|literal\n↓literal\nccc");
+	});
+
+	it("rejects replacement payload at virtual BOF/EOF anchors", () => {
+		expect(() => parseHashline(["BOF:", repl("HEAD")].join("\n"))).toThrow(/virtual positions/);
+		expect(() => parseHashline(["EOF:", repl("TAIL")].join("\n"))).toThrow(/virtual positions/);
+	});
+
+	it("rejects unprefixed payload continuation lines", () => {
 		const anchor = tag(2, "bbb");
-		const diff = [`${anchor}↓first inline`, pl("second from next line")].join("\n");
-		expect(applyDiff(content, diff)).toBe("aaa\nbbb\nfirst inline\nsecond from next line\nccc");
+		expect(() => parseHashline(`${anchor}:\n${repl("FIRST")}\nSECOND`)).toThrow(/must start with/);
 	});
 
-	it("combines an inline payload with subsequent payload lines on the replace op", () => {
-		const anchor = tag(2, "bbb");
-		const diff = [`${anchor}:FIRST`, pl("SECOND")].join("\n");
-		expect(applyDiff(content, diff)).toBe("aaa\nFIRST\nSECOND\nccc");
-	});
-
-	it("preserves whitespace-bearing inline payload exactly", () => {
+	it("preserves whitespace-bearing payload exactly", () => {
 		const anchor = tag(2, "bbb");
 		const payload = "\tconst streamKeepaliveMs = opts.streamKeepaliveMs;";
-		expect(applyDiff(content, `${anchor}↓${payload}`)).toBe(`aaa\nbbb\n${payload}\nccc`);
-		expect(applyDiff(content, `${anchor}↑${payload}`)).toBe(`aaa\n${payload}\nbbb\nccc`);
+		expect(applyDiff(content, [`${anchor}:`, below(payload)].join("\n"))).toBe(`aaa\nbbb\n${payload}\nccc`);
+		expect(applyDiff(content, [`${anchor}:`, above(payload)].join("\n"))).toBe(`aaa\n${payload}\nbbb\nccc`);
 	});
 
 	it("auto-absorbs duplicated multiline prefix boundaries during replacement", () => {
 		const source = ["// one", "// two", "old();"].join("\n");
-		const diff = [`${sameLineRange(tag(3, "old();"))}:// one`, pl("// two"), pl("new();")].join("\n");
+		const diff = [`${sameLineRange(tag(3, "old();"))}:`, repl("// one"), repl("// two"), repl("new();")].join("\n");
 
 		expect(applyDiff(source, diff)).toBe(["// one", "// two", "new();"].join("\n"));
 	});
 
 	it("auto-absorbs duplicated multiline suffix boundaries during replacement", () => {
 		const source = ["old();", "// one", "// two"].join("\n");
-		const diff = [`${sameLineRange(tag(1, "old();"))}:new();`, pl("// one"), pl("// two")].join("\n");
+		const diff = [`${sameLineRange(tag(1, "old();"))}:`, repl("new();"), repl("// one"), repl("// two")].join("\n");
 
 		expect(applyDiff(source, diff)).toBe(["new();", "// one", "// two"].join("\n"));
 	});
 
 	it("auto-absorbs a duplicated single structural suffix during replacement", () => {
 		const source = ["old();", "};"].join("\n");
-		const diff = [`${sameLineRange(tag(1, "old();"))}:new();`, pl("};")].join("\n");
+		const diff = [`${sameLineRange(tag(1, "old();"))}:`, repl("new();"), repl("};")].join("\n");
 
 		expect(applyDiff(source, diff)).toBe(["new();", "};"].join("\n"));
 	});
 
 	it("auto-absorbs a duplicated single structural prefix during replacement", () => {
 		const source = ["};", "old();"].join("\n");
-		const diff = [`${sameLineRange(tag(2, "old();"))}:};`, pl("new();")].join("\n");
+		const diff = [`${sameLineRange(tag(2, "old();"))}:`, repl("};"), repl("new();")].join("\n");
 
 		expect(applyDiff(source, diff)).toBe(["};", "new();"].join("\n"));
 	});
@@ -180,14 +321,14 @@ describe("hashline parser — suffix-op syntax", () => {
 		// `}` is a legitimate part of the new block, not a duplicate of the file's
 		// existing `}`. The single-line structural absorb must NOT fire here.
 		const source = ["old();", "}"].join("\n");
-		const diff = [`${sameLineRange(tag(1, "old();"))}:if ok {`, pl("}")].join("\n");
+		const diff = [`${sameLineRange(tag(1, "old();"))}:`, repl("if ok {"), repl("}")].join("\n");
 
 		expect(applyDiff(source, diff)).toBe(["if ok {", "}", "}"].join("\n"));
 	});
 
 	it("does not auto-absorb a single duplicated boundary line", () => {
 		const source = ["keep", "old();"].join("\n");
-		const diff = [`${sameLineRange(tag(2, "old();"))}:keep`, pl("new();")].join("\n");
+		const diff = [`${sameLineRange(tag(2, "old();"))}:`, repl("keep"), repl("new();")].join("\n");
 
 		expect(applyDiff(source, diff)).toBe(["keep", "keep", "new();"].join("\n"));
 	});
@@ -197,14 +338,21 @@ describe("hashline parser — suffix-op syntax", () => {
 		// is also the anchor of a separate insert. Absorbing it would silently
 		// steal that anchor and turn the insert into a replacement.
 		const source = ["A", "B", "X", "Y", "Z"].join("\n");
-		const diff = [`${tag(1, "A")}-${tag(2, "B")}:alpha`, pl("X"), pl("Y"), `${tag(4, "Y")}↑extra`].join("\n");
+		const diff = [
+			`${tag(1, "A")}-${tag(2, "B")}:`,
+			repl("alpha"),
+			repl("X"),
+			repl("Y"),
+			`${tag(4, "Y")}:`,
+			above("extra"),
+		].join("\n");
 
 		expect(applyDiff(source, diff)).toBe(["alpha", "X", "Y", "X", "extra", "Y", "Z"].join("\n"));
 	});
 
 	it("surfaces a warning when boundary duplicates are auto-absorbed", () => {
 		const source = ["// one", "// two", "old();"].join("\n");
-		const diff = [`${sameLineRange(tag(3, "old();"))}:// one`, pl("// two"), pl("new();")].join("\n");
+		const diff = [`${sameLineRange(tag(3, "old();"))}:`, repl("// one"), repl("// two"), repl("new();")].join("\n");
 
 		const result = applyHashlineEdits(source, parseHashline(diff).edits);
 		expect(result.lines).toBe(["// one", "// two", "new();"].join("\n"));
@@ -214,98 +362,140 @@ describe("hashline parser — suffix-op syntax", () => {
 		);
 	});
 
+	it("auto-absorbs a single duplicated non-structural prefix during replacement when opt-in is set", () => {
+		// Regression: `103-138:const X = …` over a file whose line 102 already
+		// reads `const X = …` produced two consecutive declarations. With the
+		// opt-in on, the leading boundary line gets dropped.
+		const source = ["const X = …", "", "const LEGACY = {", "  a: 1,", "}"].join("\n");
+		const diff = [`${tag(2, "")}-${tag(5, "}")}:`, repl("const X = …")].join("\n");
+
+		const result = applyHashlineEdits(source, parseHashline(diff).edits, { autoDropPureInsertDuplicates: true });
+		expect(result.lines).toBe(["const X = …"].join("\n"));
+		expect(result.warnings).toEqual(
+			expect.arrayContaining([expect.stringMatching(/Auto-absorbed 1 duplicate line\(s\) above replacement/)]),
+		);
+	});
+
+	it("auto-absorbs a single duplicated non-structural suffix during replacement when opt-in is set", () => {
+		// Regression: `93-104:## Subagents` over a file whose line 105 already
+		// reads `## Subagents` produced two consecutive headings. With the
+		// opt-in on, the trailing boundary line gets dropped.
+		const source = ["## Legacy", "", "stale content", "", "## Subagents"].join("\n");
+		const diff = [`${tag(1, "## Legacy")}-${tag(4, "")}:`, repl("## Subagents")].join("\n");
+
+		const result = applyHashlineEdits(source, parseHashline(diff).edits, { autoDropPureInsertDuplicates: true });
+		expect(result.lines).toBe(["## Subagents"].join("\n"));
+		expect(result.warnings).toEqual(
+			expect.arrayContaining([expect.stringMatching(/Auto-absorbed 1 duplicate line\(s\) below replacement/)]),
+		);
+	});
+
+	it("preserves a legitimate single-line replacement that happens to match an adjacent line by default", () => {
+		// Without the opt-in, `2:foo` over `[1]foo,[2]bar,[3]baz` must still
+		// produce two consecutive `foo` lines. The non-structural single-line
+		// absorber stays gated on `autoDropPureInsertDuplicates`.
+		const source = ["foo", "bar", "baz"].join("\n");
+		const diff = [`${sameLineRange(tag(2, "bar"))}:`, repl("foo")].join("\n");
+
+		expect(applyDiff(source, diff)).toBe(["foo", "foo", "baz"].join("\n"));
+	});
+
 	it("does not auto-drop generic (multi-line) pure-insert duplicate boundaries by default", () => {
 		// Multi-line context echo (`aaa`, `bbb`) is gated on the
-		// `autoDropPureInsertDuplicates` opt-in, unlike the single-line
-		// structural absorb covered by the test below.
+		// `autoDropPureInsertDuplicates` opt-in. Single-line pure-insert
+		// duplicates stay literal because they are ambiguous.
 		const source = ["aaa", "bbb", "ccc"].join("\n");
-		const diff = [`${tag(2, "bbb")}↓aaa`, pl("bbb"), pl("NEW")].join("\n");
+		const diff = [`${tag(2, "bbb")}:`, below("aaa"), below("bbb"), below("NEW")].join("\n");
 		expect(applyDiff(source, diff)).toBe("aaa\nbbb\naaa\nbbb\nNEW\nccc");
 	});
 
-	it("auto-drops a duplicated single structural suffix for pure insert by default", () => {
+	it("preserves a duplicated single structural suffix for pure insert by default", () => {
 		const source = ["if ok {", "   keep();", "   }"].join("\n");
-		const diff = [`${tag(3, "   }")}↑   added();`, pl("   }")].join("\n");
+		const diff = [`${tag(3, "   }")}:`, above("   added();"), above("   }")].join("\n");
 
-		expect(applyDiff(source, diff)).toBe(["if ok {", "   keep();", "   added();", "   }"].join("\n"));
+		expect(applyDiff(source, diff)).toBe(["if ok {", "   keep();", "   added();", "   }", "   }"].join("\n"));
 	});
 
-	it("auto-drops a duplicated single structural prefix for pure insert by default", () => {
+	it("preserves a duplicated single structural prefix for pure insert even when duplicate absorption is enabled", () => {
 		const source = ["   });", "next();"].join("\n");
-		const diff = [`${tag(1, "   });")}↓   });`, pl("added();")].join("\n");
+		const diff = [`${tag(1, "   });")}:`, below("   });"), below("added();")].join("\n");
+		const result = applyHashlineEdits(source, parseHashline(diff).edits, { autoDropPureInsertDuplicates: true });
 
-		expect(applyDiff(source, diff)).toBe(["   });", "added();", "next();"].join("\n"));
+		expect(result.lines).toBe(["   });", "   });", "added();", "next();"].join("\n"));
+		expect(result.warnings).toBeUndefined();
 	});
 
-	it("preserves an intentional non-structural anchor duplicate for `ANCHOR↓` by default", () => {
+	it("preserves an intentional non-structural anchor duplicate for below insert by default", () => {
 		const source = ["aaa", "bbb", "ccc"].join("\n");
-		const diff = [`${tag(2, "bbb")}↓bbb`, pl("NEW")].join("\n");
+		const diff = [`${tag(2, "bbb")}:`, below("bbb"), below("NEW")].join("\n");
 
 		expect(applyDiff(source, diff)).toBe("aaa\nbbb\nbbb\nNEW\nccc");
 	});
 
-	it("preserves an intentional non-structural anchor duplicate for `ANCHOR↑` by default", () => {
+	it("preserves an intentional non-structural anchor duplicate for above insert by default", () => {
 		const source = ["aaa", "bbb", "ccc"].join("\n");
-		const diff = [`${tag(2, "bbb")}↑NEW`, pl("bbb")].join("\n");
+		const diff = [`${tag(2, "bbb")}:`, above("NEW"), above("bbb")].join("\n");
 
 		expect(applyDiff(source, diff)).toBe("aaa\nNEW\nbbb\nbbb\nccc");
 	});
 
 	it("does not drop a single structural pure-insert suffix when it preserves balance", () => {
 		const source = ["if outer {", "}"].join("\n");
-		const diff = [`${tag(2, "}")}↑if inner {`, pl("}")].join("\n");
+		const diff = [`${tag(2, "}")}:`, above("if inner {"), above("}")].join("\n");
 
 		expect(applyDiff(source, diff)).toBe(["if outer {", "if inner {", "}", "}"].join("\n"));
 	});
 
-	it("auto-absorbs duplicated leading payload of a pure `ANCHOR↓` insert", () => {
+	it("auto-absorbs duplicated leading payload of a pure below insert", () => {
 		// Payload echoes the two file lines AT/ABOVE the insertion point
 		// (aaa, bbb), then adds NEW. The leading echo is absorbed.
 		const source = ["aaa", "bbb", "ccc"].join("\n");
-		const diff = [`${tag(2, "bbb")}↓aaa`, pl("bbb"), pl("NEW")].join("\n");
+		const diff = [`${tag(2, "bbb")}:`, below("aaa"), below("bbb"), below("NEW")].join("\n");
 		expect(applyDiffWithPureInsertAutoDrop(source, diff)).toBe("aaa\nbbb\nNEW\nccc");
 	});
 
-	it("auto-absorbs context-wrap echo (leading-above + trailing-below) on `ANCHOR↓`", () => {
+	it("auto-absorbs context-wrap echo (leading-above + trailing-below) on below insert", () => {
 		// Payload wraps NEW with context above (aaa, bbb) AND below (ccc, ddd).
 		// Both ends should be absorbed, leaving only NEW inserted after bbb.
 		const source = ["aaa", "bbb", "ccc", "ddd"].join("\n");
-		const diff = [`${tag(2, "bbb")}↓aaa`, pl("bbb"), pl("NEW"), pl("ccc"), pl("ddd")].join("\n");
+		const diff = [`${tag(2, "bbb")}:`, below("aaa"), below("bbb"), below("NEW"), below("ccc"), below("ddd")].join(
+			"\n",
+		);
 		expect(applyDiffWithPureInsertAutoDrop(source, diff)).toBe("aaa\nbbb\nNEW\nccc\nddd");
 	});
 
-	it("auto-absorbs duplicated trailing payload of a pure `ANCHOR↑` insert", () => {
+	it("auto-absorbs duplicated trailing payload of a pure above insert", () => {
 		// Insert before line 3 ("ccc"). Trailing payload echoes the anchor and the
 		// line after it. Drop the trailing duplicates.
 		const source = ["aaa", "bbb", "ccc", "ddd"].join("\n");
-		const diff = [`${tag(3, "ccc")}↑NEW`, pl("ccc"), pl("ddd")].join("\n");
+		const diff = [`${tag(3, "ccc")}:`, above("NEW"), above("ccc"), above("ddd")].join("\n");
 		expect(applyDiffWithPureInsertAutoDrop(source, diff)).toBe("aaa\nbbb\nNEW\nccc\nddd");
 	});
 
 	it("auto-absorbs duplicated leading payload at EOF insert", () => {
 		const source = ["aaa", "bbb", "ccc"].join("\n");
-		// `EOF↓` payload echoes the last two file lines, then adds NEW.
-		const diff = ["EOF↓bbb", pl("ccc"), pl("NEW")].join("\n");
+		// `EOF:` payload echoes the last two file lines, then adds NEW.
+		const diff = ["EOF:", below("bbb"), below("ccc"), below("NEW")].join("\n");
 		expect(applyDiffWithPureInsertAutoDrop(source, diff)).toBe("aaa\nbbb\nccc\nNEW");
 	});
 
 	it("auto-absorbs duplicated trailing payload at BOF insert", () => {
 		const source = ["aaa", "bbb", "ccc"].join("\n");
-		// `BOF↑` payload prepends NEW but trails with the first two file lines.
-		const diff = ["BOF↑NEW", pl("aaa"), pl("bbb")].join("\n");
+		// `BOF:` payload prepends NEW but trails with the first two file lines.
+		const diff = ["BOF:", above("NEW"), above("aaa"), above("bbb")].join("\n");
 		expect(applyDiffWithPureInsertAutoDrop(source, diff)).toBe("NEW\naaa\nbbb\nccc");
 	});
 
-	it("auto-drops a single duplicated anchor line in a pure insert when generic duplicate absorption is enabled", () => {
+	it("preserves a single duplicated anchor line in a pure insert even when generic duplicate absorption is enabled", () => {
 		const source = ["aaa", "bbb", "ccc"].join("\n");
-		const diff = [`${tag(2, "bbb")}↓bbb`, pl("NEW")].join("\n");
+		const diff = [`${tag(2, "bbb")}:`, below("bbb"), below("NEW")].join("\n");
 
-		expect(applyDiffWithPureInsertAutoDrop(source, diff)).toBe("aaa\nbbb\nNEW\nccc");
+		expect(applyDiffWithPureInsertAutoDrop(source, diff)).toBe("aaa\nbbb\nbbb\nNEW\nccc");
 	});
 
 	it("surfaces a warning when pure-insert duplicates are auto-dropped", () => {
 		const source = ["aaa", "bbb", "ccc"].join("\n");
-		const diff = [`${tag(2, "bbb")}↓aaa`, pl("bbb"), pl("NEW")].join("\n");
+		const diff = [`${tag(2, "bbb")}:`, below("aaa"), below("bbb"), below("NEW")].join("\n");
 		const result = applyHashlineEdits(source, parseHashline(diff).edits, { autoDropPureInsertDuplicates: true });
 		expect(result.lines).toBe("aaa\nbbb\nNEW\nccc");
 		expect(result.warnings).toBeDefined();
@@ -315,72 +505,85 @@ describe("hashline parser — suffix-op syntax", () => {
 	});
 
 	it("preserves payload text exactly", () => {
-		const diff = [`${sameLineRange(tag(2, "bbb"))}:`, pl("# not a header"), pl("+ not an op"), pl("  spaced")].join(
-			"\n",
-		);
-		expect(applyDiff(content, diff)).toBe("aaa\n\n# not a header\n+ not an op\n  spaced\nccc");
+		const diff = [
+			`${sameLineRange(tag(2, "bbb"))}:`,
+			repl(""),
+			repl("# not a header"),
+			repl("+ not an op"),
+			repl("\\ not an op"),
+			repl("  spaced"),
+		].join("\n");
+		expect(applyDiff(content, diff)).toBe("aaa\n\n# not a header\n+ not an op\n\\ not an op\n  spaced\nccc");
 	});
 
-	it("treats blank lines inside a payload run as empty payload lines", () => {
-		// Truly blank lines inside an active payload run are verbatim empty
-		// payload lines as long as more payload follows.
-		const diff = [`${sameLineRange(tag(2, "bbb"))}:first`, "", "", pl("after")].join("\n");
+	it("treats explicit empty replace payload rows as blank lines", () => {
+		const diff = [`${sameLineRange(tag(2, "bbb"))}:`, repl("first"), repl(""), repl(""), repl("after")].join("\n");
 		expect(applyDiff(content, diff)).toBe("aaa\nfirst\n\n\nafter\nccc");
 	});
 
-	it("drops blank lines between ops (separator, not payload)", () => {
-		// Blank lines immediately before a next op are visual separators, not
-		// payload. This prevents agents from silently inflating a payload and
-		// shifting downstream line numbers.
-		const diff = [`${sameLineRange(tag(1, "aaa"))}:AAA`, "", "", `${sameLineRange(tag(3, "ccc"))}:CCC`].join("\n");
+	it("skips markdown-comment lines immediately before an operation", () => {
+		const diff = [
+			"# This is a comment line from a model explanation.",
+			"## Another comment line.",
+			`${tag(2, "bbb")}:`,
+			repl("BBB"),
+		].join("\n");
+		expect(applyDiff(content, diff)).toBe("aaa\nBBB\nccc");
+	});
+
+	it("does not skip comment lines when they are not immediately before an operation", () => {
+		const diff = ["# This is a stray comment.", "", `${tag(2, "bbb")}:`, repl("BBB")].join("\n");
+		expect(() => parseHashline(diff)).toThrow(/payload line has no preceding/);
+	});
+
+	it("preserves raw blank separators between ops", () => {
+		const diff = [
+			`${sameLineRange(tag(1, "aaa"))}:`,
+			repl("AAA"),
+			"",
+			"",
+			`${sameLineRange(tag(3, "ccc"))}:`,
+			repl("CCC"),
+		].join("\n");
 		expect(applyDiff(content, diff)).toBe("AAA\nbbb\nCCC");
 	});
 
-	it("treats a bare insert op as inserting one empty line", () => {
-		// `LINE↑` / `LINE↓` with no payload default to one empty line (same as `LINE↑\n\n`).
-		const upAnchor = { line: 1 };
-		expect(parseHashline(`${tag(1, "aaa")}↑`).edits).toEqual([
-			{ kind: "insert", cursor: { kind: "before_anchor", anchor: upAnchor }, text: "", lineNum: 1, index: 0 },
+	it("inserts explicit blank lines above and below an anchor", () => {
+		const anchor = { line: 1 };
+		expect(parseHashline(`${tag(1, "aaa")}:\n${above("")}`).edits).toEqual([
+			{ kind: "insert", cursor: { kind: "before_anchor", anchor }, text: "", lineNum: 1, index: 0 },
 		]);
-		expect(parseHashline(`${tag(1, "aaa")}↓`).edits).toEqual([
-			{ kind: "insert", cursor: { kind: "after_anchor", anchor: upAnchor }, text: "", lineNum: 1, index: 0 },
+		expect(parseHashline(`${tag(1, "aaa")}:\n${below("")}`).edits).toEqual([
+			{ kind: "insert", cursor: { kind: "after_anchor", anchor }, text: "", lineNum: 1, index: 0 },
 		]);
 	});
 
 	it("rejects orphan payload lines with no preceding op", () => {
-		expect(() => parseHashline(pl("orphan")).edits).toThrow(/payload line has no preceding/);
-	});
-
-	it("rejects op sigils written in prefix position", () => {
-		expect(() => parseHashline(`↑${tag(1, "aaa")}\nold`).edits).toThrow(/unrecognized op/);
-		expect(() => parseHashline(`↓${tag(1, "aaa")}\nold`).edits).toThrow(/unrecognized op/);
-		expect(() => parseHashline(`:${tag(1, "aaa")}\nold`).edits).toThrow(/unrecognized op/);
+		expect(() => parseHashline(repl("orphan")).edits).toThrow(/payload line has no preceding/);
 	});
 
 	it("rejects ranges with `..` separator", () => {
-		// `..` is no longer the range separator; the line is treated as orphan
-		// payload because `2..3:` does not match the new range pattern.
-		expect(() => parseHashline(`${tag(2, "bbb")}..${tag(3, "ccc")}:\nBBB`).edits).toThrow(
+		expect(() => parseHashline(`${tag(2, "bbb")}..${tag(3, "ccc")}:\n${repl("BBB")}`).edits).toThrow(
 			/payload line has no preceding/,
 		);
 	});
 
-	it("describes the new sigil shape on unknown-op lines", () => {
-		expect(() => parseHashline(`-${sameLineRange(tag(2, "bbb"))}`).edits).toThrow(
-			/Use LINE↑.*LINE↓.*LINE: \/ A-B:.*LINE! \/ A-B!/,
-		);
+	it("describes the new block shape on unknown-op lines", () => {
+		expect(() => parseHashline(`-${sameLineRange(tag(2, "bbb"))}`).edits).toThrow(/Use A-B:, A:, BOF:, or EOF:/);
 	});
 
-	it("treats `LINE:TEXT` copied from read output as a single-line replace", () => {
+	it("rejects `LINE:TEXT` copied verbatim from read output", () => {
 		const anchor = tag(2, "bbb");
-		expect(applyDiff(content, `${anchor}:BBB`)).toBe("aaa\nBBB\nccc");
-		expect(applyDiff(content, `${anchor}-${tag(3, "ccc")}:BBB`)).toBe("aaa\nBBB");
+		expect(() => parseHashline(`${anchor}:BBB`)).toThrow(/Inline payload on the anchor line is rejected/);
+		expect(() => parseHashline(`${anchor}-${tag(3, "ccc")}:BBB`)).toThrow(
+			/Inline payload on the anchor line is rejected/,
+		);
 	});
 
 	it("leniently strips `*`/`>` line-marker decoration from anchors", () => {
 		const anchor = tag(2, "bbb");
-		expect(applyDiff(content, `*${anchor}:BBB`)).toBe("aaa\nBBB\nccc");
-		expect(applyDiff(content, `>${anchor}↑X`)).toBe("aaa\nX\nbbb\nccc");
+		expect(applyDiff(content, `*${anchor}:\n${repl("BBB")}`)).toBe("aaa\nBBB\nccc");
+		expect(applyDiff(content, `>${anchor}:\n${above("X")}`)).toBe("aaa\nX\nbbb\nccc");
 	});
 
 	it("rejects arrow replace syntax as an unrecognized payload line", () => {
@@ -388,105 +591,181 @@ describe("hashline parser — suffix-op syntax", () => {
 		expect(() => parseHashline(`2-3→\nBBB`).edits).toThrow(/payload line has no preceding/);
 	});
 
-	it("treats `LINE:TEXT` as replace syntax even when TEXT contains ↑ / ↓", () => {
+	it("preserves payload text containing arrow sigils after the leading payload sigil", () => {
 		const anchor = tag(2, "bbb");
-		expect(applyDiff(content, `${anchor}:bbb↓`)).toBe("aaa\nbbb↓\nccc");
-		expect(applyDiff(content, `${anchor}:bbb↑\nX`)).toBe("aaa\nbbb↑\nX\nccc");
+		expect(applyDiff(content, `${anchor}:\n${repl("bbb↑")}\n${below("tail↓")}`)).toBe("aaa\nbbb↑\ntail↓\nccc");
 	});
 
-	it("uses inline payload for BOF/EOF inserts", () => {
-		expect(applyDiff(content, `BOF↓HEAD`)).toBe("HEAD\naaa\nbbb\nccc");
-		expect(applyDiff(content, `EOF↓TAIL`)).toBe("aaa\nbbb\nccc\nTAIL");
-		expect(() => parseHashline(`2!keep`).edits).toThrow(
-			/deletes only\. Payload is forbidden after !; use : to replace/,
+	it("accepts BOF/EOF inserts with either arrow payload sigil", () => {
+		expect(applyDiff(content, `BOF:\n${below("HEAD")}`)).toBe("HEAD\naaa\nbbb\nccc");
+		expect(applyDiff(content, `EOF:\n${above("TAIL")}`)).toBe("aaa\nbbb\nccc\nTAIL");
+	});
+
+	it("coalesces two replace ops targeting the same single line (last wins)", () => {
+		const diff = `${tag(2, "bbb")}:\n${repl("BBB")}\n${tag(2, "bbb")}:\n${repl("BBB2")}`;
+		const { edits, warnings } = parseHashline(diff);
+		expect(applyHashlineEdits("aaa\nbbb\nccc", edits).lines).toBe("aaa\nBBB2\nccc");
+		expect(warnings).toEqual([
+			"Detected two identical-range hashline blocks; kept only the second block. Issue ONE block per range — payload is the final desired content, never both old and new.",
+		]);
+	});
+
+	it("coalesces two replace ops covering the same range (before/after-block pattern, last wins)", () => {
+		const diff = `${tag(2, "bbb")}-${tag(3, "ccc")}:\n${repl("OLD")}\n${repl("OLD2")}\n${tag(2, "bbb")}-${tag(3, "ccc")}:\n${repl("NEW")}\n${repl("NEW2")}`;
+		const { edits, warnings } = parseHashline(diff);
+		expect(applyHashlineEdits("aaa\nbbb\nccc\nddd", edits).lines).toBe("aaa\nNEW\nNEW2\nddd");
+		expect(warnings).toEqual([
+			"Detected two identical-range hashline blocks; kept only the second block. Issue ONE block per range — payload is the final desired content, never both old and new.",
+		]);
+	});
+
+	it("still rejects two replace ops whose ranges partially overlap without containment", () => {
+		// 3-5 extends past the outer 2-4, so it is neither identical nor contained.
+		// The inner anchors still clash with the outer range's deletes and the
+		// post-hoc validator catches the overlap.
+		const diff = `${tag(2, "bbb")}-${tag(4, "ddd")}:\n${repl("NEW1")}\n${tag(3, "ccc")}-${tag(5, "eee")}:\n${repl("NEW2")}`;
+		expect(() => parseHashline(diff).edits).toThrow(/anchor line 3 is already targeted by the : block on line 1/);
+	});
+
+	it("uses `|` payload lines inside a multi-line replacement", () => {
+		const diff = `${tag(2, "bbb")}-${tag(4, "ddd")}:\n${repl("line one")}\n${repl("line two")}\n${repl("line three")}`;
+		const { edits, warnings } = parseHashline(diff);
+		expect(applyHashlineEdits("aaa\nbbb\nccc\nddd\neee", edits).lines).toBe(
+			"aaa\nline one\nline two\nline three\neee",
 		);
+		expect(warnings).toEqual([]);
+	});
+
+	it("rejects read-output `N:TEXT` lines inside a pending `A-B:` block", () => {
+		const diff = `${tag(2, "bbb")}-${tag(4, "ddd")}:\n${repl("line one")}\n${tag(3, "ccc")}:line two`;
+		expect(() => parseHashline(diff)).toThrow(/Inline payload on the anchor line is rejected/);
+	});
+
+	it("treats `N:` outside the pending range as a separate op", () => {
+		const diff = `${tag(2, "bbb")}-${tag(3, "ccc")}:\n${repl("line one")}\n${tag(5, "eee")}:\n${repl("line five")}`;
+		const { edits, warnings } = parseHashline(diff);
+		expect(applyHashlineEdits("aaa\nbbb\nccc\nddd\neee\nfff", edits).lines).toBe(
+			"aaa\nline one\nddd\nline five\nfff",
+		);
+		expect(warnings).toEqual([]);
+	});
+
+	it("accepts multiple inserts in the same bucket", () => {
+		const diff = `${tag(2, "bbb")}:\n${above("X")}\n${above("Y")}`;
+		expect(applyDiff(content, diff)).toBe("aaa\nX\nY\nbbb\nccc");
+	});
+
+	it("accepts a replace alongside an insert at the same anchor", () => {
+		const diff = `${tag(2, "bbb")}:\n${above("ABOVE")}\n${repl("NEW")}`;
+		expect(applyDiff(content, diff)).toBe("aaa\nABOVE\nNEW\nccc");
 	});
 });
 
 describe("hashline — file hash binding", () => {
 	it("rejects line-hash anchors as unrecognized payload lines", () => {
-		expect(() => parseHashline("2ab:\nBBB").edits).toThrow(/payload line has no preceding/);
+		expect(() => parseHashline(`2ab:\n${repl("BBB")}`).edits).toThrow(/payload line has no preceding/);
 	});
 
 	it("applies line-number edits without per-anchor hash validation", () => {
-		const diff = `${sameLineRange(tag(2, "bbb"))}:BBB`;
+		const diff = `${sameLineRange(tag(2, "bbb"))}:\n${repl("BBB")}`;
 		expect(applyDiff("aaa\nbbb\nccc", diff)).toBe("aaa\nBBB\nccc");
 	});
 });
 
 describe("splitHashlineInput — ¶ headers", () => {
 	it("extracts path, file hash, and diff body from ¶path#hash header", () => {
-		const input = [`¶src/foo.ts#1a2b`, `${sameLineRange(tag(2, "bbb"))}:`, pl("BBB")].join("\n");
+		const input = [`¶src/foo.ts#1a2b`, `${sameLineRange(tag(2, "bbb"))}:`, repl("BBB")].join("\n");
 		expect(splitHashlineInput(input)).toEqual({
 			path: "src/foo.ts",
 			fileHash: "1a2b",
-			diff: `${sameLineRange(tag(2, "bbb"))}:\n${pl("BBB")}`,
+			diff: `${sameLineRange(tag(2, "bbb"))}:\n${repl("BBB")}`,
 		});
 	});
 
 	it("strips leading blank lines", () => {
-		expect(splitHashlineInput(`\n¶foo.ts\nBOF↓\n${pl("x")}`)).toEqual({
+		expect(splitHashlineInput(`\n¶foo.ts\nBOF:\n${below("x")}`)).toEqual({
 			path: "foo.ts",
-			diff: `BOF↓\n${pl("x")}`,
+			diff: `BOF:\n${below("x")}`,
 		});
 	});
 
 	it("normalizes cwd-prefixed absolute paths to cwd-relative paths", () => {
 		const cwd = process.cwd();
 		const absolute = path.join(cwd, "src", "foo.ts");
-		expect(splitHashlineInput(`¶${absolute}\nBOF↓\n${pl("x")}`, { cwd }).path).toBe("src/foo.ts");
+		expect(splitHashlineInput(`¶${absolute}\nBOF:\n${below("x")}`, { cwd }).path).toBe("src/foo.ts");
 	});
 
 	it("uses explicit fallback path only when input has recognizable operations", () => {
-		expect(splitHashlineInput(`BOF↓\n${pl("x")}`, { path: "a.ts" })).toEqual({
+		expect(splitHashlineInput(`BOF:\n${below("x")}`, { path: "a.ts" })).toEqual({
 			path: "a.ts",
-			diff: `BOF↓\n${pl("x")}`,
+			diff: `BOF:\n${below("x")}`,
 		});
 		expect(() => splitHashlineInput("plain text", { path: "a.ts" })).toThrow(/must begin with/);
 	});
 
 	it("splits multiple edit sections", () => {
-		const input = ["¶a.ts", "BOF↓", pl("a"), "¶b.ts", "EOF↓", pl("b")].join("\n");
+		const input = ["¶a.ts", "BOF:", below("a"), "¶b.ts", "EOF:", below("b")].join("\n");
 		expect(splitHashlineInputs(input)).toEqual([
-			{ path: "a.ts", diff: `BOF↓\n${pl("a")}` },
-			{ path: "b.ts", diff: `EOF↓\n${pl("b")}` },
+			{ path: "a.ts", diff: `BOF:\n${below("a")}` },
+			{ path: "b.ts", diff: `EOF:\n${below("b")}` },
 		]);
 	});
 
 	it("tolerates extra ¶ chars on the section header", () => {
-		const input = ["¶¶a.ts", "BOF↓", pl("a"), "¶¶¶b.ts", "EOF↓", pl("b")].join("\n");
+		const input = ["¶¶a.ts", "BOF:", below("a"), "¶¶¶b.ts", "EOF:", below("b")].join("\n");
 		expect(splitHashlineInputs(input)).toEqual([
-			{ path: "a.ts", diff: `BOF↓\n${pl("a")}` },
-			{ path: "b.ts", diff: `EOF↓\n${pl("b")}` },
+			{ path: "a.ts", diff: `BOF:\n${below("a")}` },
+			{ path: "b.ts", diff: `EOF:\n${below("b")}` },
 		]);
 	});
 
 	it("silently drops a duplicate header with no operations between them", () => {
-		const input = ["¶¶src/foo.ts", "¶¶src/foo.ts", `BOF↓`, pl("x")].join("\n");
-		expect(splitHashlineInputs(input)).toEqual([{ path: "src/foo.ts", diff: `BOF↓\n${pl("x")}` }]);
+		const input = ["¶¶src/foo.ts", "¶¶src/foo.ts", "BOF:", below("x")].join("\n");
+		expect(splitHashlineInputs(input)).toEqual([{ path: "src/foo.ts", diff: `BOF:\n${below("x")}` }]);
 	});
 
 	it("silently drops a trailing header with no operations", () => {
-		const input = ["¶¶a.ts", "BOF↓", pl("a"), "¶¶b.ts"].join("\n");
-		expect(splitHashlineInputs(input)).toEqual([{ path: "a.ts", diff: `BOF↓\n${pl("a")}` }]);
+		const input = ["¶¶a.ts", "BOF:", below("a"), "¶¶b.ts"].join("\n");
+		expect(splitHashlineInputs(input)).toEqual([{ path: "a.ts", diff: `BOF:\n${below("a")}` }]);
 	});
+});
+
+it("preflights write policy for every section before committing a batch", async () => {
+	const fixture = new PolicyFilesystem(
+		[
+			["a.ts", "aaa\n"],
+			["b.ts", "bbb\n"],
+		],
+		["b.ts"],
+	);
+	const input = [
+		header("a.ts", "aaa\n"),
+		`${sameLineRange(tag(1, "aaa"))}:`,
+		repl("AAA"),
+		header("b.ts", "bbb\n"),
+		`${sameLineRange(tag(1, "bbb"))}:`,
+		repl("BBB"),
+	].join("\n");
+
+	await expect(new Patcher({ fs: fixture }).apply(Patch.parse(input))).rejects.toThrow(/blocked write: b\.ts/);
+	expect(fixture.get("a.ts")).toBe("aaa\n");
+	expect(fixture.get("b.ts")).toBe("bbb\n");
 });
 
 describe("hashline executor", () => {
 	it("creates a missing file with a file-scoped insert", async () => {
 		await withTempDir(async tempDir => {
-			const input = `¶new.ts\nBOF↓${pl("export const x = 1;")}\n`;
+			const input = `¶new.ts\nBOF:\n${below("export const x = 1;")}\n`;
 			const result = await executeHashlineSingle(hashlineExecuteOptions(tempDir, input));
-			expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("new.ts:");
+			expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("¶new.ts#");
 			expect(await Bun.file(path.join(tempDir, "new.ts")).text()).toBe("export const x = 1;");
 		});
 	});
-
 	it("honors the pure-insert duplicate auto-drop setting", async () => {
 		await withTempDir(async tempDir => {
 			const filePath = path.join(tempDir, "a.ts");
 			const source = ["aaa", "bbb", "ccc"].join("\n");
-			const input = `${header("a.ts", source)}\n${tag(2, "bbb")}↓${pl("aaa")}\n${pl("bbb")}\n${pl("NEW")}\n`;
+			const input = `${header("a.ts", source)}\n${tag(2, "bbb")}:\n${below("aaa")}\n${below("bbb")}\n${below("NEW")}\n`;
 
 			await Bun.write(filePath, source);
 			await executeHashlineSingle(hashlineExecuteOptions(tempDir, input));
@@ -509,9 +788,11 @@ describe("hashline executor", () => {
 			const bHeader = "¶b.ts#0000";
 			const input = [
 				header("a.ts", "aaa\n"),
-				`${sameLineRange(tag(1, "aaa"))}:AAA`,
+				`${sameLineRange(tag(1, "aaa"))}:`,
+				repl("AAA"),
 				bHeader,
-				`${sameLineRange(tag(1, "bbb"))}:BBB`,
+				`${sameLineRange(tag(1, "bbb"))}:`,
+				repl("BBB"),
 			].join("\n");
 
 			await expect(executeHashlineSingle(hashlineExecuteOptions(tempDir, input))).rejects.toThrow(
@@ -519,6 +800,27 @@ describe("hashline executor", () => {
 			);
 			expect(await Bun.file(aPath).text()).toBe("aaa\n");
 			expect(await Bun.file(bPath).text()).toBe("bbb\n");
+		});
+	});
+
+	it("rejects duplicate canonical targets before writing stale section results", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const source = "one\ntwo\n";
+			await Bun.write(filePath, source);
+			const input = [
+				header("a.ts", source),
+				`${sameLineRange(tag(1, "one"))}:`,
+				repl("ONE"),
+				header("./a.ts", source),
+				`${sameLineRange(tag(2, "two"))}:`,
+				repl("TWO"),
+			].join("\n");
+
+			await expect(executeHashlineSingle(hashlineExecuteOptions(tempDir, input))).rejects.toThrow(
+				/resolve to the same file/,
+			);
+			expect(await Bun.file(filePath).text()).toBe(source);
 		});
 	});
 
@@ -535,17 +837,19 @@ describe("hashline executor", () => {
 			// validation outright.
 			const input = [
 				header("a.ts", `${original}\n`),
-				`${sameLineRange(tag(2, "L2"))}:L2a`,
-				pl("L2b"),
-				pl("L2c"),
-				pl("L2d"),
-				pl("L2e"),
-				pl("L2f"),
-				pl("L2g"),
-				pl("L2h"),
-				pl("L2i"),
+				`${sameLineRange(tag(2, "L2"))}:`,
+				repl("L2a"),
+				repl("L2b"),
+				repl("L2c"),
+				repl("L2d"),
+				repl("L2e"),
+				repl("L2f"),
+				repl("L2g"),
+				repl("L2h"),
+				repl("L2i"),
 				header("a.ts", `${original}\n`),
-				`${tag(8, "L8")}↓INSERTED`,
+				`${tag(8, "L8")}:`,
+				below("INSERTED"),
 			].join("\n");
 
 			await executeHashlineSingle(hashlineExecuteOptions(tempDir, input));
@@ -578,9 +882,27 @@ describe("hashline executor", () => {
 	});
 });
 
-describe("hashlineEditParamsSchema — extra-field tolerance", () => {
-	it("accepts extra `path` field alongside `input`", () => {
-		expect(hashlineEditParamsSchema.safeParse({ path: "x.ts", input: `¶x.ts\nBOF↓\n${pl("x")}` }).success).toBe(true);
+describe("hashlineEditParamsSchema — payload shape", () => {
+	it("declares only `input` as the model-facing field", () => {
+		const jsonSchema = z.toJSONSchema(hashlineEditParamsSchema) as {
+			properties?: Record<string, unknown>;
+			required?: string[];
+		};
+
+		expect(Object.keys(jsonSchema.properties ?? {})).toEqual(["input"]);
+		expect(jsonSchema.required).toEqual(["input"]);
+	});
+
+	it("tolerates provider extra fields without declaring `path`", () => {
+		expect(hashlineEditParamsSchema.safeParse({ path: "x.ts", input: `¶x.ts\nBOF:\n${below("x")}` }).success).toBe(
+			true,
+		);
+	});
+
+	it("accepts `_input` as a provider-emitted alias for `input`", () => {
+		const parsed = hashlineEditParamsSchema.safeParse({ _input: `¶x.ts\nBOF:\n${below("x")}` });
+		expect(parsed.success).toBe(true);
+		if (parsed.success) expect(parsed.data.input).toBe(`¶x.ts\nBOF:\n${below("x")}`);
 	});
 
 	it("still requires `input`", () => {
@@ -648,7 +970,7 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 			await Bun.write(filePath, `${v1Lines.join("\n")}\n`);
 
 			// Model authors anchor against V0 — line 2 is "L2" in V0.
-			const input = `${header("a.ts", v0Text)}\n${sameLineRange(tag(2, "L2"))}:${pl("L2-MODEL")}\n`;
+			const input = `${header("a.ts", v0Text)}\n${sameLineRange(tag(2, "L2"))}:\n${repl("L2-MODEL")}\n`;
 			const result = await executeHashlineSingle(hashlineExecuteOptions(tempDir, input, undefined, session));
 
 			const finalLines = (await Bun.file(filePath).text()).replace(/\n$/, "").split("\n");
@@ -683,7 +1005,7 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 			v1Lines[5] = "L6-CHANGED";
 			await Bun.write(filePath, `${v1Lines.join("\n")}\n`);
 
-			const input = `${header("a.ts", v0Text)}\n${sameLineRange(tag(6, "L6"))}:${pl("L6-MODEL")}\n`;
+			const input = `${header("a.ts", v0Text)}\n${sameLineRange(tag(6, "L6"))}:\n${repl("L6-MODEL")}\n`;
 			await expect(
 				executeHashlineSingle(hashlineExecuteOptions(tempDir, input, undefined, session)),
 			).rejects.toThrow(HashlineMismatchError);
@@ -704,7 +1026,7 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 		// Live file is completely different — patch context cannot match even
 		// with fuzz tolerance.
 		const currentText = "totally\nunrelated\ncontent\nhere\nnow\n";
-		const edits = parseHashline(`${sameLineRange(tag(2, "beta"))}:${pl("BETA-MODEL")}`).edits;
+		const edits = parseHashline(`${sameLineRange(tag(2, "beta"))}:\n${repl("BETA-MODEL")}`).edits;
 
 		const recovered = tryRecoverHashlineWithCache({
 			cache,
@@ -722,8 +1044,8 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 		const b = new FileReadCache();
 		const fakePath = "/tmp/__hashline-cache-isolation__.ts";
 		a.recordContiguous(fakePath, 1, ["x", "y", "z"]);
-		expect(a.get(fakePath)).not.toBeNull();
-		expect(b.get(fakePath)).toBeNull();
+		expect(a.head(fakePath)).not.toBeNull();
+		expect(b.head(fakePath)).toBeNull();
 	});
 
 	it("captures the post-edit result so the next edit can recover from anchors against it", async () => {
@@ -742,11 +1064,11 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 
 			// First edit: change line 2 : BETA. After the write, the cache should
 			// reflect V1 (post-edit), not V0.
-			const firstInput = `${header("a.ts", v0Text)}\n${sameLineRange(tag(2, "beta"))}:${pl("BETA")}\n`;
+			const firstInput = `${header("a.ts", v0Text)}\n${sameLineRange(tag(2, "beta"))}:\n${repl("BETA")}\n`;
 			await executeHashlineSingle(hashlineExecuteOptions(tempDir, firstInput, undefined, session));
 			const v1Lines = ["alpha", "BETA", "gamma", "delta", "epsilon"];
 			expect(await Bun.file(filePath).text()).toBe(`${v1Lines.join("\n")}\n`);
-			const snap = getFileReadCache(session).get(filePath);
+			const snap = getFileReadCache(session).head(filePath);
 			expect(snap?.lines.get(1)).toBe("alpha");
 			expect(snap?.lines.get(2)).toBe("BETA");
 			expect(snap?.lines.get(3)).toBe("gamma");
@@ -758,7 +1080,7 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 			const v2Lines = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", ...v1Lines];
 			await Bun.write(filePath, `${v2Lines.join("\n")}\n`);
 
-			const secondInput = `${header("a.ts", `${v1Lines.join("\n")}\n`)}\n${sameLineRange(tag(3, "gamma"))}:${pl("GAMMA")}\n`;
+			const secondInput = `${header("a.ts", `${v1Lines.join("\n")}\n`)}\n${sameLineRange(tag(3, "gamma"))}:\n${repl("GAMMA")}\n`;
 			const result = await executeHashlineSingle(hashlineExecuteOptions(tempDir, secondInput, undefined, session));
 
 			const finalLines = (await Bun.file(filePath).text()).replace(/\n$/, "").split("\n");
@@ -791,7 +1113,7 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 			absolutePath: fakePath,
 			currentText,
 			fileHash: computeFileHash(v0Text),
-			edits: parseHashline(`10:L10-EDITED`).edits,
+			edits: parseHashline(`10:\n${repl("L10-EDITED")}`).edits,
 			options: {},
 		});
 
@@ -809,9 +1131,9 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 				fileHash: computeFileHash(version),
 			});
 		}
-		expect(cache.get(fakePath)?.fileHash).toBe(computeFileHash("three\n"));
-		expect(cache.getByHash(fakePath, computeFileHash("one\n"))?.fullText).toBe("one\n");
-		expect(cache.getByHash(fakePath, computeFileHash("two\n"))?.fullText).toBe("two\n");
+		expect(cache.head(fakePath)?.fileHash).toBe(computeFileHash("three\n"));
+		expect(cache.byHash(fakePath, computeFileHash("one\n"))?.fullText).toBe("one\n");
+		expect(cache.byHash(fakePath, computeFileHash("two\n"))?.fullText).toBe("two\n");
 	});
 
 	it("drops a cached entry when newly recorded lines disagree on overlap", () => {
@@ -826,7 +1148,7 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 			[7, "g"],
 		]);
 
-		const snap = cache.get(fakePath);
+		const snap = cache.head(fakePath);
 		expect(snap).not.toBeNull();
 		// Old entries dropped; only the divergent record's entries remain.
 		expect(snap?.lines.has(1)).toBe(false);
@@ -841,10 +1163,10 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 		for (let i = 0; i < 32; i++) {
 			cache.recordContiguous(`/tmp/file-${i}.ts`, 1, ["x"]);
 		}
-		expect(cache.get("/tmp/file-0.ts")).toBeNull();
-		expect(cache.get("/tmp/file-1.ts")).toBeNull();
-		expect(cache.get("/tmp/file-2.ts")).not.toBeNull();
-		expect(cache.get("/tmp/file-31.ts")).not.toBeNull();
+		expect(cache.head("/tmp/file-0.ts")).toBeNull();
+		expect(cache.head("/tmp/file-1.ts")).toBeNull();
+		expect(cache.head("/tmp/file-2.ts")).not.toBeNull();
+		expect(cache.head("/tmp/file-31.ts")).not.toBeNull();
 	});
 });
 
@@ -852,7 +1174,7 @@ describe("hashline *** Abort recovery sentinel (harmony-leak mitigation)", () =>
 	const sentinel = "*** Abort";
 
 	it("parser breaks at *** Abort and surfaces a warning", () => {
-		const diff = [`${tag(1, "alpha")}↓HELLO`, sentinel, `${tag(99, "junk")}↓never`].join("\n");
+		const diff = [`${tag(1, "alpha")}:`, below("HELLO"), sentinel, `${tag(99, "junk")}:`, below("never")].join("\n");
 		const { edits, warnings } = parseHashline(diff);
 		expect(edits).toHaveLength(1);
 		expect(edits[0]).toMatchObject({ kind: "insert", text: "HELLO" });
@@ -862,7 +1184,7 @@ describe("hashline *** Abort recovery sentinel (harmony-leak mitigation)", () =>
 
 	it("appended sentinel from harmony-leak truncation: ops above are preserved", () => {
 		// Mirrors the exact shape harmony-leak emits inside a single section.
-		const diff = `${tag(1, "alpha")}↓${pl("KEPT")}\n*** Abort\n`;
+		const diff = `${tag(1, "alpha")}:\n${below("KEPT")}\n*** Abort\n`;
 		const { edits, warnings } = parseHashline(diff);
 		expect(edits).toHaveLength(1);
 		expect(edits[0]).toMatchObject({ text: "KEPT" });
@@ -872,12 +1194,12 @@ describe("hashline *** Abort recovery sentinel (harmony-leak mitigation)", () =>
 	it("splitter respects *** Abort like *** End Patch", () => {
 		const input = [
 			`¶a.ts`,
-			`${tag(1, "alpha")}↓`,
-			pl("a-payload"),
+			`${tag(1, "alpha")}:`,
+			below("a-payload"),
 			sentinel,
 			`¶b.ts`,
-			`${tag(1, "beta")}↓`,
-			pl("never-emitted"),
+			`${tag(1, "beta")}:`,
+			below("never-emitted"),
 		].join("\n");
 		const sections = splitHashlineInputs(input);
 		expect(sections).toHaveLength(1);
@@ -886,97 +1208,66 @@ describe("hashline *** Abort recovery sentinel (harmony-leak mitigation)", () =>
 	});
 
 	it("clean input without sentinel produces no warning", () => {
-		const diff = `${tag(1, "alpha")}↓${pl("PAYLOAD")}\n`;
+		const diff = `${tag(1, "alpha")}:\n${below("PAYLOAD")}\n`;
 		const { warnings } = parseHashline(diff);
 		expect(warnings).toEqual([]);
 	});
 });
 
-describe("hashline parser — bare ':' replaces with a single blank line", () => {
-	it("bare A: replaces the line with a single blank line", () => {
+describe("hashline parser — blank payload rows", () => {
+	it("bare A: deletes the line", () => {
 		const text = "line1\nline2\nline3\n";
 		const { diff } = splitHashlineInput(`${header("a.ts", text)}\n2:\n`);
-		expect(applyDiff(text, diff)).toBe("line1\n\nline3\n");
+		expect(applyDiff(text, diff)).toBe("line1\nline3\n");
 	});
 
-	it("bare A-B: replaces the range with a single blank line", () => {
+	it("bare A-B: deletes the range", () => {
 		const text = "line1\nline2\nline3\nline4\n";
 		const { diff } = splitHashlineInput(`${header("a.ts", text)}\n2-3:\n`);
-		expect(applyDiff(text, diff)).toBe("line1\n\nline4\n");
+		expect(applyDiff(text, diff)).toBe("line1\nline4\n");
 	});
 
-	it("A: with inline body still works", () => {
+	it("A: with inline body is rejected", () => {
 		const text = "line1\nline2\nline3\n";
 		const { diff } = splitHashlineInput(`${header("a.ts", text)}\n2:replacement\n`);
-		expect(applyDiff(text, diff)).toBe("line1\nreplacement\nline3\n");
+		expect(() => parseHashline(diff)).toThrow(/Inline payload on the anchor line is rejected/);
 	});
 
-	it("bare A↑ still inserts a blank line above", () => {
+	it("explicit empty above/below rows insert blank lines", () => {
 		const text = "line1\nline2\nline3\n";
-		const { diff } = splitHashlineInput(`${header("a.ts", text)}\n2↑\n`);
-		expect(applyDiff(text, diff)).toBe("line1\n\nline2\nline3\n");
-	});
+		const aboveDiff = splitHashlineInput(`${header("a.ts", text)}\n2:\n${above("")}\n`).diff;
+		expect(applyDiff(text, aboveDiff)).toBe("line1\n\nline2\nline3\n");
 
-	it("bare A↓ still inserts a blank line below", () => {
-		const text = "line1\nline2\nline3\n";
-		const { diff } = splitHashlineInput(`${header("a.ts", text)}\n2↓\n`);
-		expect(applyDiff(text, diff)).toBe("line1\nline2\n\nline3\n");
+		const belowDiff = splitHashlineInput(`${header("a.ts", text)}\n2:\n${below("")}\n`).diff;
+		expect(applyDiff(text, belowDiff)).toBe("line1\nline2\n\nline3\n");
 	});
 });
 
-describe("hashline apply — brace-delete soft warning", () => {
-	it("deleting a line with unbalanced brace emits a warning", () => {
-		const text = "if (x) {\n  doThing();\n} else {\n  doOther();\n}\n";
-		const { diff } = splitHashlineInput(`${header("a.ts", text)}\n3!\n`);
-		const result = applyHashlineEdits(text, parseHashline(diff).edits);
-		expect(result.warnings).toBeDefined();
-		expect(result.warnings![0]).toContain("structural bracket/brace boundary");
-		expect(result.warnings![0]).toContain("} else {");
-	});
-
-	it("deleting a balanced line emits no warning", () => {
-		const text = "line1\nline2\nline3\n";
-		const { diff } = splitHashlineInput(`${header("a.ts", text)}\n2!\n`);
-		const result = applyHashlineEdits(text, parseHashline(diff).edits);
-		expect(result.warnings).toBeUndefined();
-	});
-
-	it("replace operation that includes a brace line does NOT warn", () => {
-		const text = "if (x) {\n  body\n}\n";
-		const { diff } = splitHashlineInput(`${header("a.ts", text)}\n3:}\n`);
-		const result = applyHashlineEdits(text, parseHashline(diff).edits);
-		expect(result.warnings).toBeUndefined();
-	});
-});
-
-describe("hashline parser — blank line is a separator before next op", () => {
-	it("blank line between ops is NOT absorbed into previous payload", () => {
+describe("hashline parser — explicit blank payload rows", () => {
+	it("raw blank lines between ops are ignored", () => {
 		const text = "a\nb\nc\nd\ne\n";
-		const ops = `${header("a.ts", text)}\n1:A\n\n3:C\n`;
-		const { diff } = splitHashlineInput(ops);
-		// Both replaces land on their target lines without inflating either payload.
-		expect(applyDiff(text, diff)).toBe("A\nb\nC\nd\ne\n");
-	});
-
-	it("multiple blank lines between ops are also dropped", () => {
-		const text = "a\nb\nc\nd\ne\n";
-		const ops = `${header("a.ts", text)}\n1:A\n\n\n\n3:C\n`;
+		const ops = `${header("a.ts", text)}\n1:\n${repl("A")}\n\n3:\n${repl("C")}\n`;
 		const { diff } = splitHashlineInput(ops);
 		expect(applyDiff(text, diff)).toBe("A\nb\nC\nd\ne\n");
 	});
 
-	it("blank-only payload before next op blanks the line", () => {
-		// Agent typed `2:` then a blank separator then `4:D`. Under bare-`A:`
-		// blank-replace semantics, `2:` blanks line 2 and `4:D` replaces line 4.
+	it("empty replace payload rows are appended as blank payload lines", () => {
 		const text = "a\nb\nc\nd\ne\n";
-		const ops = `${header("a.ts", text)}\n2:\n\n4:D\n`;
+		const ops = `${header("a.ts", text)}\n1:\n${repl("A")}\n${repl("")}\n${repl("")}\n3:\n${repl("C")}\n`;
 		const { diff } = splitHashlineInput(ops);
-		expect(applyDiff(text, diff)).toBe("a\n\nc\nD\ne\n");
+		expect(applyDiff(text, diff)).toBe("A\n\n\nb\nC\nd\ne\n");
 	});
 
-	it("blank line inside payload between two content lines is preserved", () => {
+	it("bare A: followed by two empty replace rows replaces the line with two blanks", () => {
+		const text = "a\nb\nc\nd\ne\n";
+		const ops = `${header("a.ts", text)}\n2:\n${repl("")}\n${repl("")}\n4:\n${repl("D")}\n`;
+		const { diff } = splitHashlineInput(ops);
+		expect(applyDiff(text, diff)).toBe("a\n\n\nc\nD\ne\n");
+	});
+
+	it("empty replace row inside payload between two content lines is preserved", () => {
 		const text = "a\nb\nc\n";
-		const ops = `${header("a.ts", text)}\n2:first\n\nsecond\n`;
+		const ops = `${header("a.ts", text)}\n2:\n${repl("first")}\n${repl("")}\n${repl("second")}\n`;
 		const { diff } = splitHashlineInput(ops);
 		expect(applyDiff(text, diff)).toBe("a\nfirst\n\nsecond\nc\n");
 	});
